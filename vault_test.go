@@ -1,77 +1,107 @@
 package main
 
 import (
-	"strings"
+	"bytes"
+	"encoding/json"
 	"testing"
 )
 
-func TestEncryptDecryptRoundTrip(t *testing.T) {
+func TestGCMRoundTrip(t *testing.T) {
+	salt, err := newSalt()
+	if err != nil {
+		t.Fatalf("newSalt: %v", err)
+	}
+	key := deriveKey("correct horse", salt)
+
 	in := &Vault{Items: []Item{
 		{Service: "github", Username: "octocat", Password: "gh-secret"},
 		{Service: "aws", Username: "root", Password: "aws-secret"},
 	}}
+	plaintext, _ := json.Marshal(in)
 
-	vf, err := encryptVault(in, "correct horse")
+	nonce, ciphertext, err := gcmEncrypt(key, plaintext)
 	if err != nil {
-		t.Fatalf("encryptVault: %v", err)
+		t.Fatalf("gcmEncrypt: %v", err)
 	}
 
-	out, err := decryptVault(vf, "correct horse")
+	got, err := gcmDecrypt(key, nonce, ciphertext)
 	if err != nil {
-		t.Fatalf("decryptVault: %v", err)
+		t.Fatalf("gcmDecrypt: %v", err)
 	}
-
-	if len(out.Items) != len(in.Items) {
-		t.Fatalf("item count = %d, want %d", len(out.Items), len(in.Items))
-	}
-	for i := range in.Items {
-		if out.Items[i] != in.Items[i] {
-			t.Errorf("item %d = %+v, want %+v", i, out.Items[i], in.Items[i])
-		}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("round trip mismatch")
 	}
 }
 
-func TestDecryptWrongPassword(t *testing.T) {
-	vf, err := encryptVault(&Vault{Items: []Item{{Service: "x"}}}, "right")
+func TestDecryptWrongKey(t *testing.T) {
+	salt, _ := newSalt()
+	right := deriveKey("right", salt)
+	wrong := deriveKey("wrong", salt)
+
+	nonce, ciphertext, err := gcmEncrypt(right, []byte(`{"items":[]}`))
 	if err != nil {
-		t.Fatalf("encryptVault: %v", err)
+		t.Fatalf("gcmEncrypt: %v", err)
 	}
-	if _, err := decryptVault(vf, "wrong"); err != errWrongPassword {
+	if _, err := gcmDecrypt(wrong, nonce, ciphertext); err != errWrongPassword {
 		t.Fatalf("err = %v, want errWrongPassword", err)
 	}
 }
 
 func TestCiphertextHasNoPlaintext(t *testing.T) {
+	salt, _ := newSalt()
+	key := deriveKey("pw", salt)
 	secret := "super-secret-value"
-	vf, err := encryptVault(&Vault{Items: []Item{
+	plaintext, _ := json.Marshal(&Vault{Items: []Item{
 		{Service: "svc", Username: "user", Password: secret},
-	}}, "pw")
+	}})
+
+	_, ciphertext, err := gcmEncrypt(key, plaintext)
 	if err != nil {
-		t.Fatalf("encryptVault: %v", err)
+		t.Fatalf("gcmEncrypt: %v", err)
 	}
-	if strings.Contains(vf.Ciphertext, secret) || strings.Contains(vf.Ciphertext, "user") {
-		t.Fatal("plaintext leaked into ciphertext field")
+	if bytes.Contains(ciphertext, []byte(secret)) || bytes.Contains(ciphertext, []byte("user")) {
+		t.Fatal("plaintext leaked into ciphertext")
 	}
 }
 
-func TestEncryptUsesFreshSaltAndNonce(t *testing.T) {
-	v := &Vault{Items: []Item{{Service: "x"}}}
-	a, err := encryptVault(v, "pw")
+func TestSaltFixedKeyStableNonceFresh(t *testing.T) {
+	// With the session model the salt (hence key) is fixed; only the nonce
+	// changes per save. Re-encrypting the same data must still differ.
+	salt, _ := newSalt()
+	key := deriveKey("pw", salt)
+	data := []byte(`{"items":[{"service":"x"}]}`)
+
+	n1, c1, err := gcmEncrypt(key, data)
 	if err != nil {
-		t.Fatalf("encryptVault: %v", err)
+		t.Fatalf("gcmEncrypt: %v", err)
 	}
-	b, err := encryptVault(v, "pw")
+	n2, c2, err := gcmEncrypt(key, data)
 	if err != nil {
-		t.Fatalf("encryptVault: %v", err)
+		t.Fatalf("gcmEncrypt: %v", err)
 	}
-	if a.Salt == b.Salt {
-		t.Error("salt was reused across saves")
-	}
-	if a.Nonce == b.Nonce {
+	if bytes.Equal(n1, n2) {
 		t.Error("nonce was reused across saves")
 	}
-	if a.Ciphertext == b.Ciphertext {
+	if bytes.Equal(c1, c2) {
 		t.Error("ciphertext identical across saves")
+	}
+}
+
+func TestVaultFileEnvelopeRoundTrip(t *testing.T) {
+	salt, _ := newSalt()
+	key := deriveKey("pw", salt)
+	nonce, ciphertext, _ := gcmEncrypt(key, []byte(`{"items":[]}`))
+
+	vf := newVaultFile(salt, nonce, ciphertext)
+	if vf.Version != vaultFileVersion {
+		t.Fatalf("version = %d, want %d", vf.Version, vaultFileVersion)
+	}
+	gotSalt, gotNonce, gotCipher, err := vf.decode()
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !bytes.Equal(gotSalt, salt) || !bytes.Equal(gotNonce, nonce) || !bytes.Equal(gotCipher, ciphertext) {
+		t.Fatal("envelope round trip mismatch")
 	}
 }
 

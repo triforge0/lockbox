@@ -1,3 +1,4 @@
 /lockbox
 /lockbox.exe
 *.vault
+*.sock

@@ -43,6 +43,11 @@ type Vault struct {
 
 // vaultFile is the encrypted on-disk JSON envelope. The plaintext Vault is
 // never written to disk; only Ciphertext (the encrypted Vault JSON) is.
+//
+// Salt is fixed for the life of the vault: the session key is derived from
+// (master password, salt) via Argon2id, and the running agent holds only that
+// derived key — not the password — so it cannot re-derive against a new salt.
+// Each save therefore reuses Salt and generates a fresh Nonce.
 type vaultFile struct {
 	Version    int    `json:"version"`
 	Salt       string `json:"salt"`       // base64, Argon2id salt
@@ -50,8 +55,7 @@ type vaultFile struct {
 	Ciphertext string `json:"ciphertext"` // base64, AES-256-GCM(vault JSON)
 }
 
-// find returns a pointer to the item matching service (case-insensitive on the
-// exact string), or nil if not present.
+// find returns a pointer to the item matching service, or nil if not present.
 func (v *Vault) find(service string) *Item {
 	for i := range v.Items {
 		if v.Items[i].Service == service {
@@ -77,71 +81,42 @@ func deriveKey(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, keyLen)
 }
 
-// encryptVault serializes v, encrypts it with a freshly generated salt and
-// nonce, and returns the on-disk envelope. A new salt is generated on every
-// save so each write produces independent ciphertext.
-func encryptVault(v *Vault, password string) (*vaultFile, error) {
-	plaintext, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("marshal vault: %w", err)
-	}
-
+// newSalt returns a fresh cryptographically random Argon2id salt.
+func newSalt() ([]byte, error) {
 	salt := make([]byte, saltLen)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return nil, fmt.Errorf("generate salt: %w", err)
 	}
+	return salt, nil
+}
 
-	key := deriveKey(password, salt)
-
+// gcmEncrypt encrypts plaintext with AES-256-GCM under key, returning a freshly
+// generated nonce and the ciphertext. It operates on raw bytes so the agent can
+// use it without knowing the vault's JSON shape.
+func gcmEncrypt(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("init cipher: %w", err)
+		return nil, nil, fmt.Errorf("init cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("init gcm: %w", err)
+		return nil, nil, fmt.Errorf("init gcm: %w", err)
 	}
-
-	nonce := make([]byte, gcm.NonceSize())
+	nonce = make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("generate nonce: %w", err)
+		return nil, nil, fmt.Errorf("generate nonce: %w", err)
 	}
-
-	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
-
-	return &vaultFile{
-		Version:    vaultFileVersion,
-		Salt:       base64.StdEncoding.EncodeToString(salt),
-		Nonce:      base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
-	}, nil
+	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+	return nonce, ciphertext, nil
 }
 
 // errWrongPassword is returned when GCM authentication fails, which for a
-// well-formed vault almost always means the master password was wrong.
+// well-formed vault almost always means the key (hence master password) is wrong.
 var errWrongPassword = errors.New("incorrect master password or corrupted vault")
 
-// decryptVault reverses encryptVault, returning the in-memory Vault.
-func decryptVault(vf *vaultFile, password string) (*Vault, error) {
-	if vf.Version != vaultFileVersion {
-		return nil, fmt.Errorf("unsupported vault version %d (expected %d)", vf.Version, vaultFileVersion)
-	}
-
-	salt, err := base64.StdEncoding.DecodeString(vf.Salt)
-	if err != nil {
-		return nil, fmt.Errorf("decode salt: %w", err)
-	}
-	nonce, err := base64.StdEncoding.DecodeString(vf.Nonce)
-	if err != nil {
-		return nil, fmt.Errorf("decode nonce: %w", err)
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(vf.Ciphertext)
-	if err != nil {
-		return nil, fmt.Errorf("decode ciphertext: %w", err)
-	}
-
-	key := deriveKey(password, salt)
-
+// gcmDecrypt reverses gcmEncrypt. A failed authentication is reported as
+// errWrongPassword.
+func gcmDecrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("init cipher: %w", err)
@@ -151,19 +126,40 @@ func decryptVault(vf *vaultFile, password string) (*Vault, error) {
 		return nil, fmt.Errorf("init gcm: %w", err)
 	}
 	if len(nonce) != gcm.NonceSize() {
-		return nil, fmt.Errorf("invalid nonce length")
+		return nil, errors.New("invalid nonce length")
 	}
-
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return nil, errWrongPassword
 	}
+	return plaintext, nil
+}
 
-	var v Vault
-	if err := json.Unmarshal(plaintext, &v); err != nil {
-		return nil, fmt.Errorf("parse decrypted vault: %w", err)
+// decode returns the raw salt, nonce, and ciphertext bytes from the envelope.
+func (vf *vaultFile) decode() (salt, nonce, ciphertext []byte, err error) {
+	if vf.Version != vaultFileVersion {
+		return nil, nil, nil, fmt.Errorf("unsupported vault version %d (expected %d)", vf.Version, vaultFileVersion)
 	}
-	return &v, nil
+	if salt, err = base64.StdEncoding.DecodeString(vf.Salt); err != nil {
+		return nil, nil, nil, fmt.Errorf("decode salt: %w", err)
+	}
+	if nonce, err = base64.StdEncoding.DecodeString(vf.Nonce); err != nil {
+		return nil, nil, nil, fmt.Errorf("decode nonce: %w", err)
+	}
+	if ciphertext, err = base64.StdEncoding.DecodeString(vf.Ciphertext); err != nil {
+		return nil, nil, nil, fmt.Errorf("decode ciphertext: %w", err)
+	}
+	return salt, nonce, ciphertext, nil
+}
+
+// newVaultFile builds an on-disk envelope from raw crypto material.
+func newVaultFile(salt, nonce, ciphertext []byte) *vaultFile {
+	return &vaultFile{
+		Version:    vaultFileVersion,
+		Salt:       base64.StdEncoding.EncodeToString(salt),
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+	}
 }
 
 // vaultDir returns ~/.lockbox.
