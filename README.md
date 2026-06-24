@@ -32,6 +32,20 @@ in-memory session backed by a background agent:
 
 ## Install
 
+### Homebrew (macOS)
+
+```sh
+brew install triforge0/tap/lockbox
+```
+
+### Pre-built binaries
+
+Download an archive for your OS/arch from the
+[releases page](https://github.com/triforge0/lockbox/releases) and put `lockbox`
+on your `PATH`. (Linux and Windows builds are published there too.)
+
+### From source
+
 ```sh
 go install ./cmd/lockbox   # installs the `lockbox` binary to $GOBIN
 ```
@@ -97,6 +111,34 @@ There is no recovery if you forget the master password — by design.
 
 `ciphertext` is the AES-256-GCM encryption of the vault's JSON representation
 (`{"items":[{"service","username","password"}, ...]}`).
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs `gofmt`/`go vet`/`go test` on every push and
+PR across Linux, macOS, and Windows. Releases are automated with
+[GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`).
+
+One-time setup for the Homebrew tap:
+
+1. Create a public repo `triforge0/homebrew-tap`.
+2. Create a GitHub Personal Access Token with `repo` scope (classic) — or a
+   fine-grained token with **Contents: read/write** on that tap repo.
+3. In this repo's settings add it as an Actions secret named
+   `HOMEBREW_TAP_GITHUB_TOKEN`.
+
+Cut a release by pushing a tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds all platforms, publishes a GitHub Release with
+archives + `checksums.txt`, and pushes the cask to the tap. Dry-run locally with:
+
+```sh
+goreleaser release --snapshot --clean --skip=publish
+```
 
 ## Notes
 

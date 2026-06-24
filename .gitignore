@@ -2,3 +2,4 @@
 /lockbox.exe
 *.vault
 *.sock
+/dist/

@@ -12,7 +12,27 @@ go vet ./...                                   # static checks
 GOOS=windows GOARCH=amd64 go build -o lockbox.exe ./cmd/lockbox   # cross-compile
 ```
 
-There is no separate lint config; `go vet` plus `gofmt` are the bar.
+There is no separate lint config; `go vet` plus `gofmt` are the bar. CI
+(`.github/workflows/ci.yml`) enforces `gofmt -l`, `go vet`, and `go test` on
+Linux/macOS/Windows.
+
+## Releasing
+
+Tag `v*` triggers `.github/workflows/release.yml`, which runs GoReleaser
+(`.goreleaser.yaml`) on ubuntu: cross-builds 6 targets, publishes a GitHub
+Release with archives + `checksums.txt`, and pushes a Homebrew **cask** to
+`triforge0/homebrew-tap` (needs the `HOMEBREW_TAP_GITHUB_TOKEN` secret). Validate
+config with `goreleaser check`; dry-run with
+`goreleaser release --snapshot --clean --skip=publish`.
+
+- The version string is injected via `-ldflags -X lockbox/internal/cli.version`
+  (the `version` command / `--version` flag print it; default `dev`).
+- GoReleaser deprecated `brews`/formulae, so we ship a cask (macOS-only); Linux
+  users use the tarballs or `go install`. The cask's `postflight` strips the
+  Gatekeeper quarantine xattr because the binary is only ad-hoc signed.
+- Release builds must use Go ≥1.23 (the runner's `stable`) so darwin binaries get
+  `LC_UUID` + an ad-hoc signature; Go 1.22.x omits `LC_UUID` and the binary
+  aborts on recent macOS.
 
 macOS toolchain note: on some Go/macOS combinations the internal linker omits
 `LC_UUID` and dyld aborts the binary (SIGABRT 134) or an externally-linked
