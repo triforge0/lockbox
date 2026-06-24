@@ -11,6 +11,10 @@ import (
 	"lockbox/internal/agent"
 )
 
+// version is overwritten at build time via
+// -ldflags "-X lockbox/internal/cli.version=<tag>" (see .goreleaser.yaml).
+var version = "dev"
+
 // usageErr marks an error as a misuse of the CLI so Execute can print usage.
 type usageErr struct{ msg string }
 
@@ -31,6 +35,7 @@ Commands:
   list                List all stored services
   delete <service>    Remove credentials for a service
   lock                End the session immediately
+  version             Print the lockbox version
 
 The vault is stored at ~/.lockbox/store.vault and is encrypted with a master
 password using Argon2id key derivation and AES-256-GCM. After "unlock", a
@@ -81,6 +86,9 @@ func run(args []string) error {
 		return cmdList(rest)
 	case "delete":
 		return cmdDelete(rest)
+	case "version", "--version", "-v":
+		fmt.Printf("lockbox %s\n", version)
+		return nil
 	case "help", "-h", "--help":
 		fmt.Println(usage)
 		return nil

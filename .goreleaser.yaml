@@ -1,0 +1,81 @@
+# GoReleaser configuration. Run locally with `goreleaser check` to validate,
+# or `goreleaser release --snapshot --clean` for a dry run.
+# Docs: https://goreleaser.com
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: lockbox
+    main: ./cmd/lockbox
+    binary: lockbox
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X lockbox/internal/cli.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: lockbox
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+# Publishes a Homebrew cask to the tap repo on each release. (GoReleaser
+# deprecated `brews`/formulae in favor of casks; casks are macOS-only, so Linux
+# users install via the release tarballs or `go install`.)
+#
+# Requires the HOMEBREW_TAP_GITHUB_TOKEN secret (a PAT with `repo` scope on
+# github.com/triforge0/homebrew-tap). Install with:
+#   brew install triforge0/tap/lockbox
+homebrew_casks:
+  - name: lockbox
+    repository:
+      owner: triforge0
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/triforge0/lockbox"
+    description: "Simple, secure cross-platform CLI password manager"
+    commit_author:
+      name: goreleaser-bot
+      email: bot@goreleaser.com
+    # The binary is only ad-hoc signed, so strip the Gatekeeper quarantine
+    # attribute on install to avoid "cannot be opened" errors.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/lockbox"]
+          end
+
+release:
+  draft: false
+  prerelease: auto
