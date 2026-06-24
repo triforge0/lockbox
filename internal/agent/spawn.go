@@ -1,4 +1,4 @@
-package main
+package agent
 
 import (
 	"encoding/base64"
@@ -9,9 +9,13 @@ import (
 	"time"
 )
 
-// spawnAgent launches a detached agent process and hands it the derived key and
-// salt over a stdin pipe. It returns once the agent's socket is responsive.
-func spawnAgent(key, salt []byte) error {
+// agentSubcommand is the hidden subcommand the binary re-execs as to become the
+// background daemon. The CLI dispatch must route this to Run.
+const agentSubcommand = "__agent"
+
+// Spawn launches a detached agent process and hands it the derived key and salt
+// over a stdin pipe. It returns once the agent's socket is responsive.
+func Spawn(key, salt []byte) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -25,7 +29,7 @@ func spawnAgent(key, salt []byte) error {
 	}
 	defer devnull.Close()
 
-	cmd := exec.Command(self, "__agent")
+	cmd := exec.Command(self, agentSubcommand)
 	cmd.Stdout = devnull
 	cmd.Stderr = devnull
 	cmd.SysProcAttr = detachSysProcAttr()
@@ -39,7 +43,7 @@ func spawnAgent(key, salt []byte) error {
 		return fmt.Errorf("start agent: %w", err)
 	}
 
-	hs := agentHandshake{
+	hs := handshake{
 		Key:  base64.StdEncoding.EncodeToString(key),
 		Salt: base64.StdEncoding.EncodeToString(salt),
 	}
@@ -57,10 +61,16 @@ func spawnAgent(key, salt []byte) error {
 	// Wait for the agent to start listening (bounded).
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if agentAlive() {
+		if Alive() {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("agent did not become ready")
+}
+
+// IsAgentInvocation reports whether the given CLI args mean "run as the daemon".
+// main/cli use this to route to Run.
+func IsAgentInvocation(command string) bool {
+	return command == agentSubcommand
 }

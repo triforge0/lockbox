@@ -33,19 +33,31 @@ in-memory session backed by a background agent:
 ## Install
 
 ```sh
-go install   # from this directory, installs the `lockbox` binary to $GOBIN
+go install ./cmd/lockbox   # installs the `lockbox` binary to $GOBIN
 ```
 
 Or build a standalone binary:
 
 ```sh
-go build -o lockbox .
+go build -o lockbox ./cmd/lockbox
 ```
 
 Cross-compile, e.g. for Windows:
 
 ```sh
-GOOS=windows GOARCH=amd64 go build -o lockbox.exe .
+GOOS=windows GOARCH=amd64 go build -o lockbox.exe ./cmd/lockbox
+```
+
+## Layout
+
+```
+cmd/lockbox/      entry point (dispatch only)
+internal/
+  cli/            commands, prompts, argument dispatch
+  model/          Vault / Item types
+  crypto/         Argon2id + AES-256-GCM
+  storage/        on-disk envelope + ~/.lockbox paths
+  agent/          the 24h session: daemon, socket IPC, spawn
 ```
 
 ## Usage
@@ -94,4 +106,4 @@ There is no recovery if you forget the master password — by design.
 - On some macOS toolchain versions Go's internal linker omits `LC_UUID`, which
   newer dyld rejects. If a freshly built binary aborts on launch, build with the
   external linker and ad-hoc sign:
-  `go build -ldflags=-linkmode=external -o lockbox . && codesign -s - -f lockbox`.
+  `go build -ldflags=-linkmode=external -o lockbox ./cmd/lockbox && codesign -s - -f lockbox`.
