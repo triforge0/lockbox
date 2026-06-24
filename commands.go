@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 )
 
 // cmdInit creates a new, empty encrypted vault. It refuses to overwrite an
 // existing vault so a stored set of credentials can't be wiped by accident.
+// init does not start a session; run "lockbox unlock" afterwards.
 func cmdInit(args []string) error {
 	if len(args) != 0 {
 		return usageError("init takes no arguments")
@@ -26,27 +29,100 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	vf, err := encryptVault(&Vault{Items: []Item{}}, password)
+	salt, err := newSalt()
 	if err != nil {
 		return err
 	}
-	if err := saveVaultFile(vf); err != nil {
+	key := deriveKey(password, salt)
+
+	plaintext, err := json.Marshal(&Vault{Items: []Item{}})
+	if err != nil {
+		return fmt.Errorf("marshal vault: %w", err)
+	}
+	nonce, ciphertext, err := gcmEncrypt(key, plaintext)
+	if err != nil {
+		return err
+	}
+	if err := saveVaultFile(newVaultFile(salt, nonce, ciphertext)); err != nil {
 		return err
 	}
 
 	path, _ := vaultPath()
 	fmt.Printf("Initialized empty vault at %s\n", path)
+	fmt.Println("Run \"lockbox unlock\" to start a session.")
 	return nil
 }
 
-// cmdAdd decrypts the vault, adds a new credential, and re-encrypts it.
+// cmdUnlock prompts for the master password, verifies it against the vault, and
+// starts a detached agent that holds the derived key in memory for 24 hours.
+func cmdUnlock(args []string) error {
+	if len(args) != 0 {
+		return usageError("unlock takes no arguments")
+	}
+
+	vf, err := loadVaultFile()
+	if err != nil {
+		return err
+	}
+	salt, nonce, ciphertext, err := vf.decode()
+	if err != nil {
+		return err
+	}
+
+	password, err := readMasterPassword()
+	if err != nil {
+		return err
+	}
+	key := deriveKey(password, salt)
+
+	// Verify the password by actually decrypting before starting a session.
+	if _, err := gcmDecrypt(key, nonce, ciphertext); err != nil {
+		return err
+	}
+
+	// Replace any existing session so the 24h clock restarts cleanly.
+	if agentAlive() {
+		_, _ = agentCall(agentRequest{Op: "lock"})
+		waitForAgentGone(time.Second)
+	}
+
+	if err := spawnAgent(key, salt); err != nil {
+		return err
+	}
+
+	resp, err := agentCall(agentRequest{Op: "status"})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Vault unlocked. Session valid until %s.\n", formatExpiry(resp.ExpiresAt))
+	return nil
+}
+
+// cmdLock immediately clears the in-memory session.
+func cmdLock(args []string) error {
+	if len(args) != 0 {
+		return usageError("lock takes no arguments")
+	}
+	if !agentAlive() {
+		fmt.Println("Already locked.")
+		return nil
+	}
+	if _, err := agentCall(agentRequest{Op: "lock"}); err != nil {
+		return err
+	}
+	waitForAgentGone(time.Second)
+	fmt.Println("Locked. Run \"lockbox unlock\" to use the vault again.")
+	return nil
+}
+
+// cmdAdd adds a new credential. Requires an active session.
 func cmdAdd(args []string) error {
 	if len(args) != 1 {
 		return usageError("add requires exactly one <service> argument")
 	}
 	service := args[0]
 
-	vault, password, err := openVault()
+	vault, err := openVault()
 	if err != nil {
 		return err
 	}
@@ -70,7 +146,7 @@ func cmdAdd(args []string) error {
 		Password: itemPassword,
 	})
 
-	if err := resealVault(vault, password); err != nil {
+	if err := saveVault(vault); err != nil {
 		return err
 	}
 
@@ -78,14 +154,14 @@ func cmdAdd(args []string) error {
 	return nil
 }
 
-// cmdGet decrypts the vault and prints the credentials for a service.
+// cmdGet prints the credentials for a service. Requires an active session.
 func cmdGet(args []string) error {
 	if len(args) != 1 {
 		return usageError("get requires exactly one <service> argument")
 	}
 	service := args[0]
 
-	vault, _, err := openVault()
+	vault, err := openVault()
 	if err != nil {
 		return err
 	}
@@ -101,13 +177,13 @@ func cmdGet(args []string) error {
 	return nil
 }
 
-// cmdList decrypts the vault and prints all stored service names.
+// cmdList prints all stored service names. Requires an active session.
 func cmdList(args []string) error {
 	if len(args) != 0 {
 		return usageError("list takes no arguments")
 	}
 
-	vault, _, err := openVault()
+	vault, err := openVault()
 	if err != nil {
 		return err
 	}
@@ -129,14 +205,14 @@ func cmdList(args []string) error {
 	return nil
 }
 
-// cmdDelete decrypts the vault, removes a service, and re-encrypts it.
+// cmdDelete removes a service. Requires an active session.
 func cmdDelete(args []string) error {
 	if len(args) != 1 {
 		return usageError("delete requires exactly one <service> argument")
 	}
 	service := args[0]
 
-	vault, password, err := openVault()
+	vault, err := openVault()
 	if err != nil {
 		return err
 	}
@@ -145,7 +221,7 @@ func cmdDelete(args []string) error {
 		return fmt.Errorf("no credentials found for %q", service)
 	}
 
-	if err := resealVault(vault, password); err != nil {
+	if err := saveVault(vault); err != nil {
 		return err
 	}
 
@@ -153,29 +229,60 @@ func cmdDelete(args []string) error {
 	return nil
 }
 
-// openVault loads the on-disk file, prompts for the master password, and
-// returns the decrypted vault along with the password (needed to reseal it).
-func openVault() (*Vault, string, error) {
+// openVault loads the on-disk file and decrypts it through the running agent.
+// It never prompts for a password; if there is no session it returns
+// errNoSession.
+func openVault() (*Vault, error) {
 	vf, err := loadVaultFile()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	password, err := readMasterPassword()
+	_, nonce, ciphertext, err := vf.decode()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	vault, err := decryptVault(vf, password)
+	plaintext, err := agentDecrypt(nonce, ciphertext)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return vault, password, nil
+	var v Vault
+	if err := json.Unmarshal(plaintext, &v); err != nil {
+		return nil, fmt.Errorf("parse decrypted vault: %w", err)
+	}
+	return &v, nil
 }
 
-// resealVault re-encrypts and saves the vault with a fresh salt and nonce.
-func resealVault(vault *Vault, password string) error {
-	vf, err := encryptVault(vault, password)
+// saveVault encrypts the vault through the agent and writes it to disk.
+func saveVault(vault *Vault) error {
+	plaintext, err := json.Marshal(vault)
+	if err != nil {
+		return fmt.Errorf("marshal vault: %w", err)
+	}
+	vf, err := agentEncrypt(plaintext)
 	if err != nil {
 		return err
 	}
 	return saveVaultFile(vf)
+}
+
+// waitForAgentGone blocks until the agent stops responding or the timeout
+// elapses, so unlock/lock don't race the previous agent's shutdown.
+func waitForAgentGone(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !agentAlive() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// formatExpiry renders an RFC3339 timestamp in the local timezone, falling back
+// to the raw value if it can't be parsed.
+func formatExpiry(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	return t.Local().Format("2006-01-02 15:04:05 MST")
 }
