@@ -1,17 +1,17 @@
-// Command lockbox is a minimal, cross-platform CLI password manager.
-//
-// Credentials live in a single AES-256-GCM encrypted vault at
-// ~/.lockbox/store.vault. The encryption key is derived from a master
-// password using Argon2id. Plaintext is never written to disk.
-package main
+// Package cli is the command-line layer: argument dispatch, user prompts, and
+// output formatting. It wires together the model, crypto, storage, and agent
+// packages but contains no business or crypto logic of its own.
+package cli
 
 import (
 	"errors"
 	"fmt"
 	"os"
+
+	"lockbox/internal/agent"
 )
 
-// usageErr marks an error as a misuse of the CLI so main can print usage.
+// usageErr marks an error as a misuse of the CLI so Execute can print usage.
 type usageErr struct{ msg string }
 
 func (e *usageErr) Error() string { return e.msg }
@@ -37,16 +37,20 @@ password using Argon2id key derivation and AES-256-GCM. After "unlock", a
 background agent holds the key in memory for 24 hours so other commands don't
 re-prompt; "lock" clears it.`
 
-func main() {
-	if err := run(os.Args[1:]); err != nil {
+// Execute runs the CLI with the given arguments (typically os.Args[1:]) and
+// returns a process exit code. All user-facing output, including usage on
+// misuse, is handled here.
+func Execute(args []string) int {
+	if err := run(args); err != nil {
 		var ue *usageErr
 		if errors.As(err, &ue) {
 			fmt.Fprintf(os.Stderr, "lockbox: %s\n\n%s\n", ue.msg, usage)
 		} else {
 			fmt.Fprintf(os.Stderr, "lockbox: %s\n", err)
 		}
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func run(args []string) error {
@@ -56,6 +60,12 @@ func run(args []string) error {
 	}
 
 	command, rest := args[0], args[1:]
+
+	// Hidden: the detached background session process. Not for direct use.
+	if agent.IsAgentInvocation(command) {
+		return agent.Run()
+	}
+
 	switch command {
 	case "init":
 		return cmdInit(rest)
@@ -71,9 +81,6 @@ func run(args []string) error {
 		return cmdList(rest)
 	case "delete":
 		return cmdDelete(rest)
-	case "__agent":
-		// Hidden: the detached background session process. Not for direct use.
-		return runAgent()
 	case "help", "-h", "--help":
 		fmt.Println(usage)
 		return nil

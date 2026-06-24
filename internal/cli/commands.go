@@ -1,10 +1,15 @@
-package main
+package cli
 
 import (
 	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
+
+	"lockbox/internal/agent"
+	"lockbox/internal/crypto"
+	"lockbox/internal/model"
+	"lockbox/internal/storage"
 )
 
 // cmdInit creates a new, empty encrypted vault. It refuses to overwrite an
@@ -15,12 +20,12 @@ func cmdInit(args []string) error {
 		return usageError("init takes no arguments")
 	}
 
-	exists, err := vaultExists()
+	exists, err := storage.Exists()
 	if err != nil {
 		return err
 	}
 	if exists {
-		path, _ := vaultPath()
+		path, _ := storage.Path()
 		return fmt.Errorf("a vault already exists at %s", path)
 	}
 
@@ -29,25 +34,25 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	salt, err := newSalt()
+	salt, err := crypto.NewSalt()
 	if err != nil {
 		return err
 	}
-	key := deriveKey(password, salt)
+	key := crypto.DeriveKey(password, salt)
 
-	plaintext, err := json.Marshal(&Vault{Items: []Item{}})
+	plaintext, err := json.Marshal(&model.Vault{Items: []model.Item{}})
 	if err != nil {
 		return fmt.Errorf("marshal vault: %w", err)
 	}
-	nonce, ciphertext, err := gcmEncrypt(key, plaintext)
+	nonce, ciphertext, err := crypto.Encrypt(key, plaintext)
 	if err != nil {
 		return err
 	}
-	if err := saveVaultFile(newVaultFile(salt, nonce, ciphertext)); err != nil {
+	if err := storage.Save(storage.New(salt, nonce, ciphertext)); err != nil {
 		return err
 	}
 
-	path, _ := vaultPath()
+	path, _ := storage.Path()
 	fmt.Printf("Initialized empty vault at %s\n", path)
 	fmt.Println("Run \"lockbox unlock\" to start a session.")
 	return nil
@@ -60,11 +65,11 @@ func cmdUnlock(args []string) error {
 		return usageError("unlock takes no arguments")
 	}
 
-	vf, err := loadVaultFile()
+	vf, err := storage.Load()
 	if err != nil {
 		return err
 	}
-	salt, nonce, ciphertext, err := vf.decode()
+	salt, nonce, ciphertext, err := vf.Decode()
 	if err != nil {
 		return err
 	}
@@ -73,28 +78,28 @@ func cmdUnlock(args []string) error {
 	if err != nil {
 		return err
 	}
-	key := deriveKey(password, salt)
+	key := crypto.DeriveKey(password, salt)
 
 	// Verify the password by actually decrypting before starting a session.
-	if _, err := gcmDecrypt(key, nonce, ciphertext); err != nil {
+	if _, err := crypto.Decrypt(key, nonce, ciphertext); err != nil {
 		return err
 	}
 
 	// Replace any existing session so the 24h clock restarts cleanly.
-	if agentAlive() {
-		_, _ = agentCall(agentRequest{Op: "lock"})
+	if agent.Alive() {
+		_ = agent.Lock()
 		waitForAgentGone(time.Second)
 	}
 
-	if err := spawnAgent(key, salt); err != nil {
+	if err := agent.Spawn(key, salt); err != nil {
 		return err
 	}
 
-	resp, err := agentCall(agentRequest{Op: "status"})
+	expiresAt, err := agent.Status()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Vault unlocked. Session valid until %s.\n", formatExpiry(resp.ExpiresAt))
+	fmt.Printf("Vault unlocked. Session valid until %s.\n", formatExpiry(expiresAt))
 	return nil
 }
 
@@ -103,11 +108,11 @@ func cmdLock(args []string) error {
 	if len(args) != 0 {
 		return usageError("lock takes no arguments")
 	}
-	if !agentAlive() {
+	if !agent.Alive() {
 		fmt.Println("Already locked.")
 		return nil
 	}
-	if _, err := agentCall(agentRequest{Op: "lock"}); err != nil {
+	if err := agent.Lock(); err != nil {
 		return err
 	}
 	waitForAgentGone(time.Second)
@@ -127,7 +132,7 @@ func cmdAdd(args []string) error {
 		return err
 	}
 
-	if vault.find(service) != nil {
+	if vault.Find(service) != nil {
 		return fmt.Errorf("service %q already exists; delete it first to replace", service)
 	}
 
@@ -140,7 +145,7 @@ func cmdAdd(args []string) error {
 		return err
 	}
 
-	vault.Items = append(vault.Items, Item{
+	vault.Items = append(vault.Items, model.Item{
 		Service:  service,
 		Username: username,
 		Password: itemPassword,
@@ -166,7 +171,7 @@ func cmdGet(args []string) error {
 		return err
 	}
 
-	item := vault.find(service)
+	item := vault.Find(service)
 	if item == nil {
 		return fmt.Errorf("no credentials found for %q", service)
 	}
@@ -217,7 +222,7 @@ func cmdDelete(args []string) error {
 		return err
 	}
 
-	if !vault.remove(service) {
+	if !vault.Remove(service) {
 		return fmt.Errorf("no credentials found for %q", service)
 	}
 
@@ -229,23 +234,23 @@ func cmdDelete(args []string) error {
 	return nil
 }
 
-// openVault loads the on-disk file and decrypts it through the running agent.
-// It never prompts for a password; if there is no session it returns
-// errNoSession.
-func openVault() (*Vault, error) {
-	vf, err := loadVaultFile()
+// openVault loads the on-disk file and decrypts it through the running agent. It
+// never prompts for a password; if there is no session it returns
+// agent.ErrNoSession.
+func openVault() (*model.Vault, error) {
+	vf, err := storage.Load()
 	if err != nil {
 		return nil, err
 	}
-	_, nonce, ciphertext, err := vf.decode()
+	_, nonce, ciphertext, err := vf.Decode()
 	if err != nil {
 		return nil, err
 	}
-	plaintext, err := agentDecrypt(nonce, ciphertext)
+	plaintext, err := agent.Decrypt(nonce, ciphertext)
 	if err != nil {
 		return nil, err
 	}
-	var v Vault
+	var v model.Vault
 	if err := json.Unmarshal(plaintext, &v); err != nil {
 		return nil, fmt.Errorf("parse decrypted vault: %w", err)
 	}
@@ -253,16 +258,16 @@ func openVault() (*Vault, error) {
 }
 
 // saveVault encrypts the vault through the agent and writes it to disk.
-func saveVault(vault *Vault) error {
+func saveVault(vault *model.Vault) error {
 	plaintext, err := json.Marshal(vault)
 	if err != nil {
 		return fmt.Errorf("marshal vault: %w", err)
 	}
-	vf, err := agentEncrypt(plaintext)
+	salt, nonce, ciphertext, err := agent.Encrypt(plaintext)
 	if err != nil {
 		return err
 	}
-	return saveVaultFile(vf)
+	return storage.Save(storage.New(salt, nonce, ciphertext))
 }
 
 // waitForAgentGone blocks until the agent stops responding or the timeout
@@ -270,7 +275,7 @@ func saveVault(vault *Vault) error {
 func waitForAgentGone(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !agentAlive() {
+		if !agent.Alive() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
