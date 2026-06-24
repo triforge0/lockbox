@@ -10,7 +10,7 @@ func TestGCMRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSalt: %v", err)
 	}
-	key := DeriveKey("correct horse", salt)
+	key := DeriveKey("correct horse", salt, Argon2Time)
 	msg := []byte(`{"items":[{"service":"github","username":"octocat","password":"gh"}]}`)
 
 	nonce, ciphertext, err := Encrypt(key, msg)
@@ -28,8 +28,8 @@ func TestGCMRoundTrip(t *testing.T) {
 
 func TestDecryptWrongKey(t *testing.T) {
 	salt, _ := NewSalt()
-	right := DeriveKey("right", salt)
-	wrong := DeriveKey("wrong", salt)
+	right := DeriveKey("right", salt, Argon2Time)
+	wrong := DeriveKey("wrong", salt, Argon2Time)
 
 	nonce, ciphertext, err := Encrypt(right, []byte(`{"items":[]}`))
 	if err != nil {
@@ -42,7 +42,7 @@ func TestDecryptWrongKey(t *testing.T) {
 
 func TestCiphertextHasNoPlaintext(t *testing.T) {
 	salt, _ := NewSalt()
-	key := DeriveKey("pw", salt)
+	key := DeriveKey("pw", salt, Argon2Time)
 	secret := "super-secret-value"
 
 	_, ciphertext, err := Encrypt(key, []byte(`{"p":"`+secret+`","u":"user"}`))
@@ -58,7 +58,7 @@ func TestFreshNoncePerEncrypt(t *testing.T) {
 	// With the session model the salt (hence key) is fixed; only the nonce
 	// changes per save. Re-encrypting the same data must still differ.
 	salt, _ := NewSalt()
-	key := DeriveKey("pw", salt)
+	key := DeriveKey("pw", salt, Argon2Time)
 	data := []byte(`{"items":[{"service":"x"}]}`)
 
 	n1, c1, err := Encrypt(key, data)

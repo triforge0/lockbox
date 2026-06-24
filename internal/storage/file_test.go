@@ -25,8 +25,20 @@ func TestVaultFileEnvelopeRoundTrip(t *testing.T) {
 }
 
 func TestDecodeRejectsWrongVersion(t *testing.T) {
-	vf := &VaultFile{Version: FileVersion + 1}
-	if _, _, _, err := vf.Decode(); err == nil {
-		t.Fatal("expected error for unsupported version")
+	for _, v := range []int{0, FileVersion + 1} {
+		vf := &VaultFile{Version: v}
+		if _, _, _, err := vf.Decode(); err == nil {
+			t.Fatalf("version %d: expected error for unsupported version", v)
+		}
+	}
+}
+
+// TestDecodeAcceptsLegacyVersion guards backward compatibility: a v1 envelope
+// must still decode so existing vaults can be opened (and upgraded on unlock).
+func TestDecodeAcceptsLegacyVersion(t *testing.T) {
+	vf := New([]byte("0123456789abcdef"), []byte("0123456789ab"), []byte("ct"))
+	vf.Version = 1
+	if _, _, _, err := vf.Decode(); err != nil {
+		t.Fatalf("v1 envelope must still decode: %v", err)
 	}
 }

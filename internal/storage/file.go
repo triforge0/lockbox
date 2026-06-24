@@ -11,9 +11,16 @@ import (
 	"path/filepath"
 )
 
-// FileVersion is the on-disk format version. Bump it if the layout or crypto
-// parameters change in a backwards-incompatible way.
-const FileVersion = 1
+// FileVersion is the current on-disk format version written by New. Bump it if
+// the layout or crypto parameters change in a backwards-incompatible way, and
+// teach Decode to accept the older versions.
+//
+// v1: Argon2id time cost 1.  v2: time cost 3 (see crypto.Argon2Time). Only the
+// KDF time cost differs, so a v1 vault is re-keyed to v2 on the next unlock.
+const FileVersion = 2
+
+// minSupportedVersion is the oldest on-disk format Decode can still read.
+const minSupportedVersion = 1
 
 // VaultFile is the encrypted on-disk JSON envelope. The plaintext vault is
 // never written to disk; only Ciphertext (the encrypted vault JSON) is.
@@ -41,8 +48,8 @@ func New(salt, nonce, ciphertext []byte) *VaultFile {
 
 // Decode returns the raw salt, nonce, and ciphertext bytes from the envelope.
 func (vf *VaultFile) Decode() (salt, nonce, ciphertext []byte, err error) {
-	if vf.Version != FileVersion {
-		return nil, nil, nil, fmt.Errorf("unsupported vault version %d (expected %d)", vf.Version, FileVersion)
+	if vf.Version < minSupportedVersion || vf.Version > FileVersion {
+		return nil, nil, nil, fmt.Errorf("unsupported vault version %d (supported %d–%d)", vf.Version, minSupportedVersion, FileVersion)
 	}
 	if salt, err = base64.StdEncoding.DecodeString(vf.Salt); err != nil {
 		return nil, nil, nil, fmt.Errorf("decode salt: %w", err)

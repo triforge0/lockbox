@@ -71,7 +71,11 @@ commands" is implemented with a **background agent daemon**:
   key + vault salt are handed to the agent over a **stdin pipe** — never via
   argv, never to disk. The agent (`agent/server.go`, `agent.Run`) holds the key
   in memory, listens on a Unix-domain socket `~/.lockbox/agent.sock` (`0600`),
-  and self-destructs after 24h (`agent.SessionTTL`), wiping the key.
+  and self-destructs after `agent.IdleTTL` of inactivity (each encrypt/decrypt
+  slides the window via `extend`), capped at `agent.MaxTTL`, wiping the key.
+  Every accepted connection is peer-authorized (`agent/peercred_*.go`,
+  `agent.authorize`): only a process running this same binary may drive the key,
+  so other local processes (even same-uid) can't ask the agent to decrypt.
 - `add`/`get`/`list`/`delete` never prompt for a password. The cli layer calls
   `agent.Encrypt`/`agent.Decrypt` (`agent/client.go`), which ask the daemon to
   process **raw blobs**, so the key never leaves the agent process. No agent or
@@ -114,11 +118,15 @@ existing session/agent.
   (Argon2id) and `golang.org/x/term` (no-echo input). Keep it that way.
 - Crypto parameters live in `crypto`; the file `version` is `storage.FileVersion`.
   Any incompatible format/KDF change must bump `FileVersion` and handle the old
-  version in `storage.VaultFile.Decode`.
+  version in `storage.VaultFile.Decode`. Current state: **v1** = Argon2id time
+  cost 1, **v2** = time cost 3 (`crypto.Argon2Time`); only the time cost differs,
+  so `cmdUnlock` re-derives with the version's cost (`argonTimeForVersion`) and
+  transparently re-keys a v1 vault to v2 on unlock. `DeriveKey` takes the time
+  cost as an argument for exactly this reason.
 - `cmdInit` refuses to overwrite an existing vault; `cmdAdd` rejects duplicate
   services. Preserve these guards — there is no undo and no password recovery.
 - Unix-socket paths are limited (~104 chars on macOS). The default home-based
   path is fine; tests that set a long `$HOME` will fail to bind the socket. Use a
   short `$HOME` (e.g. `/tmp/lbh`) when running the binary end-to-end in tests.
-- The 24h expiry can't be waited out in tests; `agent/agent_test.go` exercises
+- The session expiry can't be waited out in tests; `agent/agent_test.go` exercises
   `agent.handle` directly over `net.Pipe` with a past `expiresAt`.

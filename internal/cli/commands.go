@@ -38,7 +38,7 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	key := crypto.DeriveKey(password, salt)
+	key := crypto.DeriveKey(password, salt, crypto.Argon2Time)
 
 	plaintext, err := json.Marshal(&model.Vault{Items: []model.Item{}})
 	if err != nil {
@@ -59,7 +59,8 @@ func cmdInit(args []string) error {
 }
 
 // cmdUnlock prompts for the master password, verifies it against the vault, and
-// starts a detached agent that holds the derived key in memory for 24 hours.
+// starts a detached agent that holds the derived key in memory. The session
+// auto-locks after agent.IdleTTL of inactivity (agent.MaxTTL absolute cap).
 func cmdUnlock(args []string) error {
 	if len(args) != 0 {
 		return usageError("unlock takes no arguments")
@@ -78,14 +79,29 @@ func cmdUnlock(args []string) error {
 	if err != nil {
 		return err
 	}
-	key := crypto.DeriveKey(password, salt)
+	key := crypto.DeriveKey(password, salt, argonTimeForVersion(vf.Version))
 
 	// Verify the password by actually decrypting before starting a session.
-	if _, err := crypto.Decrypt(key, nonce, ciphertext); err != nil {
+	plaintext, err := crypto.Decrypt(key, nonce, ciphertext)
+	if err != nil {
 		return err
 	}
 
-	// Replace any existing session so the 24h clock restarts cleanly.
+	// Transparently re-key an older vault to the current Argon2id parameters.
+	// We have the password here, so we can re-derive against the (unchanged)
+	// salt and re-encrypt; the agent only ever sees the upgraded key.
+	if vf.Version < storage.FileVersion {
+		key = crypto.DeriveKey(password, salt, crypto.Argon2Time)
+		nonce, ciphertext, err = crypto.Encrypt(key, plaintext)
+		if err != nil {
+			return err
+		}
+		if err := storage.Save(storage.New(salt, nonce, ciphertext)); err != nil {
+			return err
+		}
+	}
+
+	// Replace any existing session so the idle clock restarts cleanly.
 	if agent.Alive() {
 		_ = agent.Lock()
 		waitForAgentGone(time.Second)
@@ -99,8 +115,18 @@ func cmdUnlock(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Vault unlocked. Session valid until %s.\n", formatExpiry(expiresAt))
+	fmt.Printf("Vault unlocked. Auto-locks at %s if idle; each use extends it (%s max).\n",
+		formatExpiry(expiresAt), agent.MaxTTL)
 	return nil
+}
+
+// argonTimeForVersion maps an on-disk vault version to the Argon2id time cost it
+// was written with, so an existing vault can be opened before being upgraded.
+func argonTimeForVersion(version int) uint32 {
+	if version <= 1 {
+		return crypto.Argon2TimeV1
+	}
+	return crypto.Argon2Time
 }
 
 // cmdLock immediately clears the in-memory session.

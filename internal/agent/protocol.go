@@ -9,8 +9,14 @@ import (
 	"time"
 )
 
-// SessionTTL is how long an unlocked session stays valid.
-const SessionTTL = 24 * time.Hour
+// IdleTTL is how long a session survives without vault activity. Each
+// encrypt/decrypt request slides this window forward, so an actively used
+// session stays open while an abandoned one locks itself quickly — shrinking the
+// window in which the in-memory key is exposed.
+const IdleTTL = 15 * time.Minute
+
+// MaxTTL is the absolute lifetime of a session regardless of activity.
+const MaxTTL = 24 * time.Hour
 
 // ErrNoSession indicates that no usable session is available, either because
 // the agent is not running or because it has expired. Callers translate this

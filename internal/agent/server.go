@@ -16,10 +16,20 @@ import (
 
 // agent is the in-memory session state held by the detached daemon process.
 type agent struct {
-	mu        sync.Mutex
-	key       []byte
-	salt      []byte
-	expiresAt time.Time
+	mu   sync.Mutex
+	key  []byte
+	salt []byte
+	// expiresAt is the current (sliding) idle deadline; extend pushes it forward
+	// on activity but never past hardDeadline.
+	expiresAt    time.Time
+	hardDeadline time.Time
+	// idleTimer wakes the accept loop when the idle deadline passes; extend
+	// resets it. nil in unit tests that drive handle directly.
+	idleTimer *time.Timer
+	// selfExe is the agent binary's own executable path, used to authorize
+	// connecting clients: only a process running the same binary may talk to
+	// the socket (see authorize / peercred_*.go).
+	selfExe string
 }
 
 // Run is the entry point for the detached agent process (the hidden "__agent"
@@ -39,6 +49,11 @@ func Run() error {
 		return fmt.Errorf("decode salt: %w", err)
 	}
 
+	selfExe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+
 	sock, err := storage.SocketPath()
 	if err != nil {
 		return err
@@ -56,25 +71,56 @@ func Run() error {
 	// Best effort on platforms with POSIX permissions; a no-op on Windows.
 	os.Chmod(sock, 0o600)
 
+	now := time.Now()
+	hardDeadline := now.Add(MaxTTL)
+	firstDeadline := now.Add(IdleTTL)
+	if firstDeadline.After(hardDeadline) {
+		firstDeadline = hardDeadline
+	}
 	a := &agent{
-		key:       key,
-		salt:      salt,
-		expiresAt: time.Now().Add(SessionTTL),
+		key:          key,
+		salt:         salt,
+		expiresAt:    firstDeadline,
+		hardDeadline: hardDeadline,
+		selfExe:      selfExe,
 	}
 	defer a.shutdown(sock)
 
-	// Self-destruct when the session expires.
-	expiryTimer := time.AfterFunc(SessionTTL, func() { ln.Close() })
-	defer expiryTimer.Stop()
+	// Self-destruct when the (sliding) idle deadline passes. extend resets this
+	// timer on activity.
+	a.idleTimer = time.AfterFunc(time.Until(firstDeadline), func() { ln.Close() })
+	defer a.idleTimer.Stop()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return nil // listener closed (lock or expiry): clean exit
 		}
+		// Authorize the peer before processing anything: only a process running
+		// this same binary may use the key. This stops any other local process
+		// (running as the same user) from asking the agent to decrypt the vault.
+		if err := a.authorize(conn); err != nil {
+			writeResponse(conn, response{OK: false, Error: "unauthorized client"})
+			conn.Close()
+			continue
+		}
 		if stop := a.handle(conn); stop {
 			return nil
 		}
+	}
+}
+
+// extend slides the idle deadline forward by IdleTTL on vault activity, capped
+// by the absolute hardDeadline, and re-arms the idle timer. The caller must hold
+// a.mu (handle does).
+func (a *agent) extend() {
+	next := time.Now().Add(IdleTTL)
+	if !a.hardDeadline.IsZero() && next.After(a.hardDeadline) {
+		next = a.hardDeadline
+	}
+	a.expiresAt = next
+	if a.idleTimer != nil {
+		a.idleTimer.Reset(time.Until(next))
 	}
 }
 
@@ -126,6 +172,7 @@ func (a *agent) handle(conn net.Conn) (stop bool) {
 			writeResponse(conn, response{OK: false, Error: err.Error()})
 			return false
 		}
+		a.extend()
 		writeResponse(conn, response{
 			OK:         true,
 			Salt:       base64.StdEncoding.EncodeToString(a.salt),
@@ -148,6 +195,7 @@ func (a *agent) handle(conn net.Conn) (stop bool) {
 			writeResponse(conn, response{OK: false, Error: err.Error()})
 			return false
 		}
+		a.extend()
 		writeResponse(conn, response{OK: true, Plaintext: base64.StdEncoding.EncodeToString(plaintext)})
 	default:
 		writeResponse(conn, response{OK: false, Error: "unknown op"})

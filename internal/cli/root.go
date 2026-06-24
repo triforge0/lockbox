@@ -29,7 +29,7 @@ Usage:
 
 Commands:
   init                Create a new encrypted vault
-  unlock              Start a 24h session (prompts for the master password)
+  unlock              Start a session (prompts for the master password)
   add <service>       Add credentials for a service
   get <service>       Show credentials for a service
   list                List all stored services
@@ -39,8 +39,9 @@ Commands:
 
 The vault is stored at ~/.lockbox/store.vault and is encrypted with a master
 password using Argon2id key derivation and AES-256-GCM. After "unlock", a
-background agent holds the key in memory for 24 hours so other commands don't
-re-prompt; "lock" clears it.`
+background agent holds the key in memory so other commands don't re-prompt; the
+session auto-locks after 15 minutes of inactivity (24h maximum), and "lock"
+clears it immediately.`
 
 // Execute runs the CLI with the given arguments (typically os.Args[1:]) and
 // returns a process exit code. All user-facing output, including usage on
