@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"lockbox/internal/agent"
+	"lockbox/internal/storage"
 )
 
 // version is overwritten at build time via
@@ -25,7 +27,7 @@ func usageError(msg string) error { return &usageErr{msg: msg} }
 const usage = `lockbox - a simple, secure CLI password manager
 
 Usage:
-  lockbox <command> [arguments]
+  lockbox [--vault <name>] <command> [arguments]
 
 Commands:
   init                Create a new encrypted vault
@@ -35,13 +37,19 @@ Commands:
   list                List all stored services
   delete <service>    Remove credentials for a service
   lock                End the session immediately
+  vaults              List all vaults and whether each is unlocked
   version             Print the lockbox version
 
-The vault is stored at ~/.lockbox/store.vault and is encrypted with a master
-password using Argon2id key derivation and AES-256-GCM. After "unlock", a
-background agent holds the key in memory so other commands don't re-prompt; the
-session auto-locks after 15 minutes of inactivity (24h maximum), and "lock"
-clears it immediately.`
+Global flags:
+  --vault, -V <name>  Operate on a named vault (default: "default"). Each vault
+                      is a separate file with its own master password and
+                      session, so unlocking one never decrypts another.
+
+Each vault is stored at ~/.lockbox/<name>.vault (the default vault is
+store.vault) and is encrypted with a master password using Argon2id key
+derivation and AES-256-GCM. After "unlock", a per-vault background agent holds
+the key in memory so other commands don't re-prompt; the session auto-locks
+after 15 minutes of inactivity (24h maximum), and "lock" clears it immediately.`
 
 // Execute runs the CLI with the given arguments (typically os.Args[1:]) and
 // returns a process exit code. All user-facing output, including usage on
@@ -60,33 +68,42 @@ func Execute(args []string) int {
 }
 
 func run(args []string) error {
-	if len(args) == 0 {
+	// Hidden: the detached background session process. Checked before flag
+	// parsing because it is re-exec'd as `lockbox __agent` with no --vault (the
+	// vault name arrives over the handshake instead).
+	if len(args) > 0 && agent.IsAgentInvocation(args[0]) {
+		return agent.Run()
+	}
+
+	vault, rest, err := extractVaultFlag(args)
+	if err != nil {
+		return err
+	}
+
+	if len(rest) == 0 {
 		fmt.Println(usage)
 		return nil
 	}
 
-	command, rest := args[0], args[1:]
-
-	// Hidden: the detached background session process. Not for direct use.
-	if agent.IsAgentInvocation(command) {
-		return agent.Run()
-	}
+	command, cmdArgs := rest[0], rest[1:]
 
 	switch command {
 	case "init":
-		return cmdInit(rest)
+		return cmdInit(vault, cmdArgs)
 	case "unlock":
-		return cmdUnlock(rest)
+		return cmdUnlock(vault, cmdArgs)
 	case "lock":
-		return cmdLock(rest)
+		return cmdLock(vault, cmdArgs)
 	case "add":
-		return cmdAdd(rest)
+		return cmdAdd(vault, cmdArgs)
 	case "get":
-		return cmdGet(rest)
+		return cmdGet(vault, cmdArgs)
 	case "list":
-		return cmdList(rest)
+		return cmdList(vault, cmdArgs)
 	case "delete":
-		return cmdDelete(rest)
+		return cmdDelete(vault, cmdArgs)
+	case "vaults":
+		return cmdVaults(cmdArgs)
 	case "version", "--version", "-v":
 		fmt.Printf("lockbox %s\n", version)
 		return nil
@@ -96,4 +113,32 @@ func run(args []string) error {
 	default:
 		return usageError(fmt.Sprintf("unknown command %q", command))
 	}
+}
+
+// extractVaultFlag pulls the global --vault/-V flag out of args (it may appear
+// anywhere), validates it, and returns the chosen vault name plus the remaining
+// arguments. The name defaults to storage.DefaultVault.
+func extractVaultFlag(args []string) (vault string, rest []string, err error) {
+	vault = storage.DefaultVault
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--vault" || a == "-V":
+			if i+1 >= len(args) {
+				return "", nil, usageError("--vault requires a name")
+			}
+			vault = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--vault="):
+			vault = strings.TrimPrefix(a, "--vault=")
+		case strings.HasPrefix(a, "-V="):
+			vault = strings.TrimPrefix(a, "-V=")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if err := storage.ValidVaultName(vault); err != nil {
+		return "", nil, usageError(err.Error())
+	}
+	return vault, rest, nil
 }

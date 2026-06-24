@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 )
 
 // FileVersion is the current on-disk format version written by New. Bump it if
@@ -63,6 +66,47 @@ func (vf *VaultFile) Decode() (salt, nonce, ciphertext []byte, err error) {
 	return salt, nonce, ciphertext, nil
 }
 
+// DefaultVault is the vault used when no --vault is given. It maps to the
+// original store.vault/agent.sock names so existing single-vault installs keep
+// working with no migration.
+const DefaultVault = "default"
+
+// vaultNamePattern restricts vault names to characters that are safe in a
+// filename and a socket name, blocking path traversal (no "/", "..", etc.).
+var vaultNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// reservedVaultNames would collide with the default vault's fixed filenames
+// (store.vault / agent.sock), so they are not allowed as explicit names.
+var reservedVaultNames = map[string]bool{"store": true, "agent": true}
+
+// ValidVaultName reports whether name is usable as a vault name.
+func ValidVaultName(name string) error {
+	if name == DefaultVault {
+		return nil
+	}
+	if !vaultNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid vault name %q: use letters, digits, '-' or '_'", name)
+	}
+	if reservedVaultNames[name] {
+		return fmt.Errorf("vault name %q is reserved", name)
+	}
+	return nil
+}
+
+func vaultFileName(name string) string {
+	if name == DefaultVault {
+		return "store.vault"
+	}
+	return name + ".vault"
+}
+
+func socketFileName(name string) string {
+	if name == DefaultVault {
+		return "agent.sock"
+	}
+	return name + ".sock"
+}
+
 // Dir returns ~/.lockbox.
 func Dir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -72,27 +116,55 @@ func Dir() (string, error) {
 	return filepath.Join(home, ".lockbox"), nil
 }
 
-// Path returns ~/.lockbox/store.vault.
-func Path() (string, error) {
+// Path returns the on-disk vault file for the named vault.
+func Path(name string) (string, error) {
 	dir, err := Dir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "store.vault"), nil
+	return filepath.Join(dir, vaultFileName(name)), nil
 }
 
-// SocketPath returns ~/.lockbox/agent.sock.
-func SocketPath() (string, error) {
+// SocketPath returns the agent socket for the named vault.
+func SocketPath(name string) (string, error) {
 	dir, err := Dir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "agent.sock"), nil
+	return filepath.Join(dir, socketFileName(name)), nil
 }
 
-// Load reads and parses the on-disk envelope.
-func Load() (*VaultFile, error) {
-	path, err := Path()
+// ListVaults returns the names of all vaults present in ~/.lockbox, sorted.
+func ListVaults() ([]string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read vault dir: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".vault") {
+			continue
+		}
+		if e.Name() == "store.vault" {
+			names = append(names, DefaultVault)
+			continue
+		}
+		names = append(names, strings.TrimSuffix(e.Name(), ".vault"))
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// Load reads and parses the named vault's on-disk envelope.
+func Load(name string) (*VaultFile, error) {
+	path, err := Path(name)
 	if err != nil {
 		return nil, err
 	}
@@ -110,9 +182,9 @@ func Load() (*VaultFile, error) {
 	return &vf, nil
 }
 
-// Save writes the envelope atomically (temp file + rename) with owner-only
-// permissions.
-func Save(vf *VaultFile) error {
+// Save writes the named vault's envelope atomically (temp file + rename) with
+// owner-only permissions.
+func Save(name string, vf *VaultFile) error {
 	dir, err := Dir()
 	if err != nil {
 		return err
@@ -126,12 +198,12 @@ func Save(vf *VaultFile) error {
 		return fmt.Errorf("encode vault file: %w", err)
 	}
 
-	path, err := Path()
+	path, err := Path(name)
 	if err != nil {
 		return err
 	}
 
-	tmp, err := os.CreateTemp(dir, "store.vault.tmp-*")
+	tmp, err := os.CreateTemp(dir, vaultFileName(name)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
@@ -155,9 +227,9 @@ func Save(vf *VaultFile) error {
 	return nil
 }
 
-// Exists reports whether a vault file is already present.
-func Exists() (bool, error) {
-	path, err := Path()
+// Exists reports whether the named vault file is already present.
+func Exists(name string) (bool, error) {
+	path, err := Path(name)
 	if err != nil {
 		return false, err
 	}

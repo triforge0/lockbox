@@ -44,8 +44,10 @@ type response struct {
 
 // handshake is what the parent writes to the agent's stdin at startup. It
 // carries the derived key and the vault's fixed salt — over a pipe, never to
-// disk and never via argv.
+// disk and never via argv — plus the vault name so the agent binds the matching
+// socket (the name is not secret; it only selects which socket to serve).
 type handshake struct {
-	Key  string `json:"key"`  // base64 derived key
-	Salt string `json:"salt"` // base64 vault salt
+	Vault string `json:"vault"` // which vault this agent serves
+	Key   string `json:"key"`   // base64 derived key
+	Salt  string `json:"salt"`  // base64 vault salt
 }

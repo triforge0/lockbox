@@ -43,9 +43,14 @@ the code is unaffected.
 
 ## Architecture
 
-`lockbox` is a CLI password manager. The whole data store is one
-AES-256-GCM-encrypted blob at `~/.lockbox/store.vault`; there is no database, no
-network, and no per-item encryption.
+`lockbox` is a CLI password manager. Each **vault** is one AES-256-GCM-encrypted
+blob; there is no database, no network, and no per-item encryption. Multiple
+named vaults can coexist under `~/.lockbox/` — the default vault (no `--vault`
+flag) is `store.vault` with socket `agent.sock`; a named vault `<n>` is
+`<n>.vault` with socket `<n>.sock`. Each vault has its own master password and
+its own agent/session, so unlocking one never decrypts another. The global
+`--vault <name>`/`-V` flag (parsed in `cli.extractVaultFlag`, validated by
+`storage.ValidVaultName`) selects which vault every command acts on.
 
 Layered into `cmd/` + `internal/` packages with a strict, acyclic dependency
 graph — keep it that way:
@@ -68,9 +73,10 @@ commands" is implemented with a **background agent daemon**:
 
 - `lockbox unlock` verifies the master password, then re-execs the same binary
   as a hidden `__agent` subcommand (`agent/spawn.go`, `agent.Spawn`). The derived
-  key + vault salt are handed to the agent over a **stdin pipe** — never via
-  argv, never to disk. The agent (`agent/server.go`, `agent.Run`) holds the key
-  in memory, listens on a Unix-domain socket `~/.lockbox/agent.sock` (`0600`),
+  key + vault salt (plus the vault name) are handed to the agent over a **stdin
+  pipe** — never via argv, never to disk. The agent (`agent/server.go`,
+  `agent.Run`) holds the key in memory, listens on that vault's Unix-domain
+  socket (`storage.SocketPath(name)`, `0600`),
   and self-destructs after `agent.IdleTTL` of inactivity (each encrypt/decrypt
   slides the window via `extend`), capped at `agent.MaxTTL`, wiping the key.
   Every accepted connection is peer-authorized (`agent/peercred_*.go`,
@@ -97,7 +103,8 @@ existing session/agent.
   on raw bytes, so no layer shares a serialization format). `ErrWrongPassword`
   is returned on GCM auth failure.
 - `storage` — the `VaultFile` envelope (`New`/`Decode`), atomic `0600` `Save`,
-  `Load`, and **all path handling** (`Dir`/`Path`/`SocketPath`).
+  `Load`, and **all path handling** (`Dir`/`Path`/`SocketPath`, all keyed by
+  vault name; `ListVaults`/`ValidVaultName`/`DefaultVault` for multi-vault).
 - `agent` — server (`Run`, `agent.handle`), client (`Alive`/`Lock`/`Status`/
   `Encrypt`/`Decrypt`), `Spawn`, and build-tagged `detachSysProcAttr`
   (`detach_unix.go`/`detach_windows.go` — the only platform-specific code).
