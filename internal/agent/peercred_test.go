@@ -4,15 +4,21 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 // unixConnPair returns a connected pair of *net.UnixConn over a short-named
 // socket (macOS limits socket paths to ~104 bytes, so we avoid t.TempDir which
-// can be long). The server side mirrors what agent.Run authorizes.
+// can be long). The server side mirrors what agent.Run authorizes. Peer
+// credentials are not part of the model on Windows (peercred_other.go fails
+// open), so the unix-socket tests skip there.
 func unixConnPair(t *testing.T) (server, client *net.UnixConn) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "lbpc")
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-domain peer credentials are not used on Windows")
+	}
+	dir, err := os.MkdirTemp(shortTempBase(), "lbpc")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
@@ -46,6 +52,16 @@ func unixConnPair(t *testing.T) (server, client *net.UnixConn) {
 	}
 	t.Cleanup(func() { r.c.Close() })
 	return r.c.(*net.UnixConn), c.(*net.UnixConn)
+}
+
+// shortTempBase returns a short base directory for the test socket. /tmp keeps
+// the socket path under the ~104-byte limit on macOS/BSD; os.TempDir is the
+// portable fallback when /tmp is absent.
+func shortTempBase() string {
+	if _, err := os.Stat("/tmp"); err == nil {
+		return "/tmp"
+	}
+	return os.TempDir()
 }
 
 // TestAuthorizeAllowsSameBinary exercises the real platform peer-credential
