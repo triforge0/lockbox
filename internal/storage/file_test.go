@@ -105,7 +105,10 @@ func TestDefaultVaultKeepsLegacyFilenames(t *testing.T) {
 
 func TestListVaults(t *testing.T) {
 	home := t.TempDir()
+	// os.UserHomeDir (used by Dir) reads HOME on Unix but USERPROFILE on
+	// Windows, so set both to redirect it to the temp dir on every platform.
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	dir := filepath.Join(home, ".lockbox")
 	if err := writeFiles(t, dir, "store.vault", "work.vault", "personal.vault", "notes.txt"); err != nil {
 		t.Fatal(err)
