@@ -41,9 +41,10 @@ func newTestAgent(t *testing.T, ttl time.Duration) *agent {
 		t.Fatalf("NewSalt: %v", err)
 	}
 	return &agent{
-		key:       crypto.DeriveKey("pw", salt),
-		salt:      salt,
-		expiresAt: time.Now().Add(ttl),
+		key:          crypto.DeriveKey("pw", salt, crypto.Argon2Time),
+		salt:         salt,
+		expiresAt:    time.Now().Add(ttl),
+		hardDeadline: time.Now().Add(ttl),
 	}
 }
 
@@ -98,6 +99,39 @@ func TestAgentEncryptDecryptRoundTrip(t *testing.T) {
 	}
 	if string(got) != string(secret) {
 		t.Errorf("round trip mismatch: got %q", got)
+	}
+}
+
+func TestAgentActivityExtendsIdleDeadline(t *testing.T) {
+	a := newTestAgent(t, time.Hour)
+	// Force the idle window close, but keep a generous hard cap so extend can
+	// push the deadline back out.
+	a.expiresAt = time.Now().Add(50 * time.Millisecond)
+	a.hardDeadline = time.Now().Add(time.Hour)
+	before := a.expiresAt
+
+	enc, stop := roundtrip(t, a, request{
+		Op:        "encrypt",
+		Plaintext: base64.StdEncoding.EncodeToString([]byte(`{"items":[]}`)),
+	})
+	if !enc.OK || stop {
+		t.Fatalf("encrypt failed: ok=%v stop=%v err=%s", enc.OK, stop, enc.Error)
+	}
+	if !a.expiresAt.After(before) {
+		t.Errorf("activity did not extend the idle deadline: before=%v after=%v", before, a.expiresAt)
+	}
+	if a.expiresAt.After(a.hardDeadline) {
+		t.Errorf("extended deadline %v exceeded hard cap %v", a.expiresAt, a.hardDeadline)
+	}
+}
+
+func TestAgentExtendNeverExceedsHardDeadline(t *testing.T) {
+	a := newTestAgent(t, time.Hour)
+	// Hard cap nearer than one IdleTTL: extend must clamp to it.
+	a.hardDeadline = time.Now().Add(time.Second)
+	a.extend()
+	if a.expiresAt.After(a.hardDeadline) {
+		t.Errorf("extend exceeded hard deadline: %v > %v", a.expiresAt, a.hardDeadline)
 	}
 }
 
