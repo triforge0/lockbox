@@ -54,7 +54,7 @@ func Run() error {
 		return fmt.Errorf("locate executable: %w", err)
 	}
 
-	sock, err := storage.SocketPath()
+	sock, err := storage.SocketPath(hs.Vault)
 	if err != nil {
 		return err
 	}

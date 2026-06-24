@@ -13,9 +13,10 @@ import (
 // background daemon. The CLI dispatch must route this to Run.
 const agentSubcommand = "__agent"
 
-// Spawn launches a detached agent process and hands it the derived key and salt
-// over a stdin pipe. It returns once the agent's socket is responsive.
-func Spawn(key, salt []byte) error {
+// Spawn launches a detached agent process for the named vault and hands it the
+// derived key and salt over a stdin pipe. It returns once the agent's socket is
+// responsive.
+func Spawn(name string, key, salt []byte) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -44,8 +45,9 @@ func Spawn(key, salt []byte) error {
 	}
 
 	hs := handshake{
-		Key:  base64.StdEncoding.EncodeToString(key),
-		Salt: base64.StdEncoding.EncodeToString(salt),
+		Vault: name,
+		Key:   base64.StdEncoding.EncodeToString(key),
+		Salt:  base64.StdEncoding.EncodeToString(salt),
 	}
 	if err := json.NewEncoder(stdin).Encode(hs); err != nil {
 		stdin.Close()
@@ -61,7 +63,7 @@ func Spawn(key, salt []byte) error {
 	// Wait for the agent to start listening (bounded).
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if Alive() {
+		if Alive(name) {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)

@@ -11,10 +11,10 @@ import (
 	"lockbox/internal/storage"
 )
 
-// call connects to the agent and performs one request/response exchange. A
-// failure to connect is reported as ErrNoSession.
-func call(req request) (*response, error) {
-	sock, err := storage.SocketPath()
+// call connects to the named vault's agent and performs one request/response
+// exchange. A failure to connect is reported as ErrNoSession.
+func call(name string, req request) (*response, error) {
+	sock, err := storage.SocketPath(name)
 	if err != nil {
 		return nil, err
 	}
@@ -45,34 +45,34 @@ func call(req request) (*response, error) {
 	return &resp, nil
 }
 
-// Alive reports whether a live, unexpired agent is currently reachable.
-func Alive() bool {
-	_, err := call(request{Op: "ping"})
+// Alive reports whether a live, unexpired agent for the named vault is reachable.
+func Alive(name string) bool {
+	_, err := call(name, request{Op: "ping"})
 	return err == nil
 }
 
-// Lock asks a running agent to clear its session and exit. It is a no-op (nil)
-// if no agent is running.
-func Lock() error {
-	if !Alive() {
+// Lock asks the named vault's agent to clear its session and exit. It is a
+// no-op (nil) if no agent is running.
+func Lock(name string) error {
+	if !Alive(name) {
 		return nil
 	}
-	_, err := call(request{Op: "lock"})
+	_, err := call(name, request{Op: "lock"})
 	return err
 }
 
-// Status returns the session expiry as an RFC3339 string.
-func Status() (expiresAt string, err error) {
-	resp, err := call(request{Op: "status"})
+// Status returns the named vault session's expiry as an RFC3339 string.
+func Status(name string) (expiresAt string, err error) {
+	resp, err := call(name, request{Op: "status"})
 	if err != nil {
 		return "", err
 	}
 	return resp.ExpiresAt, nil
 }
 
-// Decrypt asks the agent to decrypt a vault envelope's payload.
-func Decrypt(nonce, ciphertext []byte) ([]byte, error) {
-	resp, err := call(request{
+// Decrypt asks the named vault's agent to decrypt an envelope's payload.
+func Decrypt(name string, nonce, ciphertext []byte) ([]byte, error) {
+	resp, err := call(name, request{
 		Op:         "decrypt",
 		Nonce:      base64.StdEncoding.EncodeToString(nonce),
 		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
@@ -83,10 +83,10 @@ func Decrypt(nonce, ciphertext []byte) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(resp.Plaintext)
 }
 
-// Encrypt asks the agent to encrypt plaintext, returning the raw salt (the
-// vault's fixed salt held by the agent), nonce, and ciphertext.
-func Encrypt(plaintext []byte) (salt, nonce, ciphertext []byte, err error) {
-	resp, err := call(request{
+// Encrypt asks the named vault's agent to encrypt plaintext, returning the raw
+// salt (the vault's fixed salt held by the agent), nonce, and ciphertext.
+func Encrypt(name string, plaintext []byte) (salt, nonce, ciphertext []byte, err error) {
+	resp, err := call(name, request{
 		Op:        "encrypt",
 		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
 	})
