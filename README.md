@@ -79,7 +79,8 @@ cmd/lockbox/      entry point (dispatch only)
 internal/
   cli/            commands, prompts, argument dispatch
   model/          Vault / Item types
-  crypto/         Argon2id + AES-256-GCM
+  crypto/         Argon2id + AES-256-GCM + password generation
+  totp/           RFC 6238 time-based one-time passwords (2FA)
   storage/        on-disk envelope + ~/.lockbox paths
   agent/          the in-memory session: daemon, socket IPC, spawn, peer-auth
 ```
@@ -89,14 +90,21 @@ internal/
 ```sh
 lockbox init                # create a new empty encrypted vault
 lockbox unlock              # start a session (prompts for master password)
-lockbox add <service>       # add credentials (prompts for username + password)
+lockbox add <service>       # add credentials (username, password, optional 2FA)
+lockbox edit <service>      # update a service (blank input keeps current value)
 lockbox get <service>       # print credentials for a service
 lockbox get <service> -p    # print only the password (pipe-friendly, no newline)
 lockbox list                # list all stored service names
+lockbox list -l             # list services with usernames and a 2FA column
+lockbox search <query>      # find services by name or username
+lockbox totp <service>      # print the current 2FA code for a service
 lockbox delete <service>    # remove a service (asks to confirm; -f to skip)
+lockbox change-password     # change the master password (re-encrypts the vault)
 lockbox status              # show whether the vault is unlocked
 lockbox lock                # end the session immediately
 lockbox vaults              # list all vaults and whether each is unlocked
+lockbox export -o out.json  # export the vault as plaintext JSON (asks to confirm)
+lockbox import in.json      # merge items from a JSON file (--overwrite to replace)
 lockbox gen [length]        # generate a random password (default length 20)
 ```
 
@@ -132,8 +140,11 @@ There is no recovery if you forget the master password — by design.
 ```
 
 `ciphertext` is the AES-256-GCM encryption of the vault's JSON representation
-(`{"items":[{"service","username","password"}, ...]}`). Version 1 vaults (1-pass
-Argon2id) are still readable and are upgraded to version 2 on the next unlock.
+(`{"items":[{"service","username","password","totp"?}, ...]}`); `totp` is an
+optional base32 2FA seed and is omitted for items without one. Version 1 vaults
+(1-pass Argon2id) are still readable and are upgraded to version 2 on the next
+unlock. `change-password` re-encrypts the vault under a new key and is the one
+operation besides `init` that mints a fresh salt; it ends any running session.
 
 ## Releasing
 

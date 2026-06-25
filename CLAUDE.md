@@ -57,14 +57,15 @@ graph — keep it that way:
 
 ```
 model/    Vault/Item types                      (no deps)
-crypto/   Argon2id DeriveKey/NewSalt, AES-GCM    (no deps)
+crypto/   Argon2id, AES-GCM, GeneratePassword    (no deps)
+totp/     RFC 6238 2FA code generation           (no deps)
 storage/  VaultFile envelope, load/save, paths   (no deps)
 agent/    the session daemon + client + spawn    (deps: crypto, storage)
-cli/      commands, prompts, dispatch            (deps: model, crypto, storage, agent)
+cli/      commands, prompts, dispatch            (deps: model, crypto, totp, storage, agent)
 cmd/lockbox/main.go  -> cli.Execute(os.Args[1:]) (deps: cli)
 ```
 
-crypto/model/storage are leaves and must not import each other or higher layers.
+crypto/model/storage/totp are leaves and must not import each other or higher layers.
 
 ### The session model is the defining design decision
 
@@ -96,12 +97,22 @@ against a new salt. So **the salt is fixed at `init` for the vault's lifetime**
 nonce. Do not reintroduce per-save salt regeneration — it would break every
 existing session/agent.
 
+The two deliberate exceptions are `init` and `change-password` (`cmdChangePassword`):
+both re-derive the key directly from the password (not through the agent), so they
+mint a fresh salt. `change-password` therefore ends any running session afterward,
+since the old in-memory key no longer matches the re-keyed vault.
+
 ### Package notes
 
 - `model` — `Vault`/`Item` plus `Find`/`Remove`. Pure data; no I/O.
 - `crypto` — `DeriveKey`/`NewSalt` (Argon2id) and `Encrypt`/`Decrypt` (AES-GCM
   on raw bytes, so no layer shares a serialization format). `ErrWrongPassword`
-  is returned on GCM auth failure.
+  is returned on GCM auth failure. `GeneratePassword` (crypto/rand, rejection
+  sampling) backs the `gen` command.
+- `totp` — RFC 6238 TOTP (`Generate`, `NormalizeSecret`); HMAC-SHA1, 30s, 6
+  digits, stdlib only. A leaf: no internal imports. `model.Item.TOTPSecret`
+  (base32, `omitempty`) stores the seed inside the vault JSON, so adding 2FA
+  needed no `FileVersion` bump.
 - `storage` — the `VaultFile` envelope (`New`/`Decode`), atomic `0600` `Save`,
   `Load`, and **all path handling** (`Dir`/`Path`/`SocketPath`, all keyed by
   vault name; `ListVaults`/`ValidVaultName`/`DefaultVault` for multi-vault).

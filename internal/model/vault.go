@@ -3,10 +3,15 @@
 package model
 
 // Item is a single stored credential.
+//
+// TOTPSecret is an optional base32 2FA seed; omitempty keeps it absent from the
+// vault JSON for credentials without 2FA, so older vaults stay byte-compatible
+// and no file-format version bump is needed.
 type Item struct {
-	Service  string `json:"service"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Service    string `json:"service"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	TOTPSecret string `json:"totp,omitempty"`
 }
 
 // Vault is the decrypted store: a flat list of credentials.

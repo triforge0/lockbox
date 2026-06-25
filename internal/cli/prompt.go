@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"golang.org/x/term"
+
+	"lockbox/internal/totp"
 )
 
 // stdin is a single shared buffered reader. Using one reader for the whole
@@ -41,6 +43,32 @@ func readSecret(prompt string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// readTOTPSecret reads a 2FA seed without echoing it (it is sensitive). Blank
+// input and the "-" sentinel are returned verbatim so callers can treat them as
+// "keep"/"remove"; any other input must be a valid base32 secret and is returned
+// canonicalized. On an interactive terminal an invalid secret is re-prompted.
+func readTOTPSecret(prompt string) (string, error) {
+	for {
+		raw, err := readSecret(prompt)
+		if err != nil {
+			return "", err
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" || raw == "-" {
+			return raw, nil
+		}
+		normalized, err := totp.NormalizeSecret(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  %v; try again or leave blank.\n", err)
+			if !term.IsTerminal(int(os.Stdin.Fd())) {
+				return "", err
+			}
+			continue
+		}
+		return normalized, nil
+	}
 }
 
 // readMasterPassword prompts once for an existing vault's master password.

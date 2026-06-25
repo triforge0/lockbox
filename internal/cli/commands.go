@@ -4,15 +4,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
+
+	"golang.org/x/term"
 
 	"lockbox/internal/agent"
 	"lockbox/internal/crypto"
 	"lockbox/internal/model"
 	"lockbox/internal/storage"
+	"lockbox/internal/totp"
 )
 
 // sessionError rewrites agent.ErrNoSession into a message naming the right
@@ -150,6 +155,65 @@ func argonTimeForVersion(version int) uint32 {
 	return crypto.Argon2Time
 }
 
+// cmdChangePassword re-keys a vault under a new master password. It verifies the
+// current password by decrypting, then re-encrypts the same contents under a key
+// derived from the new password. This is the one operation that mints a fresh
+// salt (init is the other): because it re-derives directly from the password —
+// not through the agent — it is not bound by the fixed-salt session invariant.
+// Any running session is ended afterward, since its key no longer matches.
+func cmdChangePassword(name string, args []string) error {
+	if len(args) != 0 {
+		return usageError("change-password takes no arguments")
+	}
+
+	vf, err := storage.Load(name)
+	if err != nil {
+		return err
+	}
+	oldSalt, nonce, ciphertext, err := vf.Decode()
+	if err != nil {
+		return err
+	}
+
+	current, err := readSecret("Current master password: ")
+	if err != nil {
+		return err
+	}
+	oldKey := crypto.DeriveKey(current, oldSalt, argonTimeForVersion(vf.Version))
+	plaintext, err := crypto.Decrypt(oldKey, nonce, ciphertext)
+	if err != nil {
+		return err
+	}
+
+	newPassword, err := readNewMasterPassword()
+	if err != nil {
+		return err
+	}
+
+	newSalt, err := crypto.NewSalt()
+	if err != nil {
+		return err
+	}
+	newKey := crypto.DeriveKey(newPassword, newSalt, crypto.Argon2Time)
+	newNonce, newCiphertext, err := crypto.Encrypt(newKey, plaintext)
+	if err != nil {
+		return err
+	}
+	if err := storage.Save(name, storage.New(newSalt, newNonce, newCiphertext)); err != nil {
+		return err
+	}
+
+	// The old session (if any) holds a key derived from the old password/salt,
+	// which no longer decrypts the vault. End it so the user re-unlocks cleanly.
+	if agent.Alive(name) {
+		_ = agent.Lock(name)
+		waitForAgentGone(name, time.Second)
+	}
+
+	fmt.Printf("Master password changed. Run %s to start a new session.\n", unlockHint(name))
+	return nil
+}
+
 // cmdLock immediately clears the in-memory session for the named vault.
 func cmdLock(name string, args []string) error {
 	if len(args) != 0 {
@@ -191,11 +255,16 @@ func cmdAdd(name string, args []string) error {
 	if err != nil {
 		return err
 	}
+	totpSecret, err := readTOTPSecret("TOTP secret (base32, blank for none): ")
+	if err != nil {
+		return err
+	}
 
 	vault.Items = append(vault.Items, model.Item{
-		Service:  service,
-		Username: username,
-		Password: itemPassword,
+		Service:    service,
+		Username:   username,
+		Password:   itemPassword,
+		TOTPSecret: totpSecret,
 	})
 
 	if err := saveVault(name, vault); err != nil {
@@ -203,6 +272,65 @@ func cmdAdd(name string, args []string) error {
 	}
 
 	fmt.Printf("Added credentials for %q\n", service)
+	return nil
+}
+
+// cmdEdit updates the username and/or password of an existing service. Empty
+// input leaves the current value unchanged. Requires an active session.
+func cmdEdit(name string, args []string) error {
+	if len(args) != 1 {
+		return usageError("edit requires exactly one <service> argument")
+	}
+	service := args[0]
+
+	vault, err := openVault(name)
+	if err != nil {
+		return err
+	}
+
+	item := vault.Find(service)
+	if item == nil {
+		return fmt.Errorf("no credentials found for %q", service)
+	}
+
+	username, err := readLine(fmt.Sprintf("Username [%s]: ", item.Username))
+	if err != nil {
+		return err
+	}
+	if username != "" {
+		item.Username = username
+	}
+
+	itemPassword, err := readSecret("Password [leave blank to keep]: ")
+	if err != nil {
+		return err
+	}
+	if itemPassword != "" {
+		item.Password = itemPassword
+	}
+
+	totpPrompt := "TOTP secret (base32, blank to keep): "
+	if item.TOTPSecret != "" {
+		totpPrompt = "TOTP secret (base32, blank to keep, \"-\" to remove): "
+	}
+	totpSecret, err := readTOTPSecret(totpPrompt)
+	if err != nil {
+		return err
+	}
+	switch totpSecret {
+	case "":
+		// keep current
+	case "-":
+		item.TOTPSecret = ""
+	default:
+		item.TOTPSecret = totpSecret
+	}
+
+	if err := saveVault(name, vault); err != nil {
+		return err
+	}
+
+	fmt.Printf("Updated credentials for %q\n", service)
 	return nil
 }
 
@@ -243,12 +371,66 @@ func cmdGet(name string, args []string) error {
 	fmt.Printf("Service:  %s\n", item.Service)
 	fmt.Printf("Username: %s\n", item.Username)
 	fmt.Printf("Password: %s\n", item.Password)
+	if item.TOTPSecret != "" {
+		code, secondsLeft, err := totp.Generate(item.TOTPSecret, time.Now())
+		if err != nil {
+			fmt.Printf("TOTP:     (invalid secret: %v)\n", err)
+		} else {
+			fmt.Printf("TOTP:     %s (expires in %ds)\n", code, secondsLeft)
+		}
+	}
 	return nil
 }
 
-// cmdList prints all stored service names. Requires an active session.
+// cmdTOTP prints the current 2FA code for a service. On a terminal it appends
+// the seconds remaining; piped, it prints just the code so it can be consumed by
+// scripts. Requires an active session.
+func cmdTOTP(name string, args []string) error {
+	if len(args) != 1 {
+		return usageError("totp requires exactly one <service> argument")
+	}
+	service := args[0]
+
+	vault, err := openVault(name)
+	if err != nil {
+		return err
+	}
+
+	item := vault.Find(service)
+	if item == nil {
+		return fmt.Errorf("no credentials found for %q", service)
+	}
+	if item.TOTPSecret == "" {
+		return fmt.Errorf("no TOTP secret set for %q; add one with \"lockbox edit %s\"", service, service)
+	}
+
+	code, secondsLeft, err := totp.Generate(item.TOTPSecret, time.Now())
+	if err != nil {
+		return err
+	}
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		fmt.Printf("%s (expires in %ds)\n", code, secondsLeft)
+	} else {
+		fmt.Println(code)
+	}
+	return nil
+}
+
+// cmdList prints stored services. By default it prints just the service names
+// (one per line, pipe-friendly); with -l/--long it prints a table including the
+// username. Requires an active session.
 func cmdList(name string, args []string) error {
-	if len(args) != 0 {
+	long := false
+	rest := args[:0:0]
+	for _, a := range args {
+		switch a {
+		case "-l", "--long":
+			long = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if len(rest) != 0 {
 		return usageError("list takes no arguments")
 	}
 
@@ -262,6 +444,11 @@ func cmdList(name string, args []string) error {
 		return nil
 	}
 
+	if long {
+		printItemTable(vault.Items)
+		return nil
+	}
+
 	services := make([]string, 0, len(vault.Items))
 	for _, item := range vault.Items {
 		services = append(services, item.Service)
@@ -272,6 +459,54 @@ func cmdList(name string, args []string) error {
 		fmt.Println(s)
 	}
 	return nil
+}
+
+// cmdSearch prints, in table form, every service whose name or username
+// contains the query (case-insensitive). Requires an active session.
+func cmdSearch(name string, args []string) error {
+	if len(args) != 1 {
+		return usageError("search requires exactly one <query> argument")
+	}
+	query := strings.ToLower(args[0])
+
+	vault, err := openVault(name)
+	if err != nil {
+		return err
+	}
+
+	var matches []model.Item
+	for _, item := range vault.Items {
+		if strings.Contains(strings.ToLower(item.Service), query) ||
+			strings.Contains(strings.ToLower(item.Username), query) {
+			matches = append(matches, item)
+		}
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No matches.")
+		return nil
+	}
+	printItemTable(matches)
+	return nil
+}
+
+// printItemTable writes the given items as an aligned SERVICE/USERNAME table,
+// sorted by service name.
+func printItemTable(items []model.Item) {
+	sorted := make([]model.Item, len(items))
+	copy(sorted, items)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Service < sorted[j].Service })
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERVICE\tUSERNAME\t2FA")
+	for _, item := range sorted {
+		twoFA := ""
+		if item.TOTPSecret != "" {
+			twoFA = "✓"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", item.Service, item.Username, twoFA)
+	}
+	w.Flush()
 }
 
 // cmdDelete removes a service. Requires an active session. Because there is no
@@ -366,6 +601,127 @@ func cmdGen(args []string) error {
 
 // genDefaultLength is the password length used by `gen` when none is given.
 const genDefaultLength = 20
+
+// cmdExport writes the decrypted vault as plaintext JSON, either to stdout or to
+// a file (-o, written 0600). Because this puts secrets in the clear it requires
+// explicit confirmation (or --yes) and an active session.
+func cmdExport(name string, args []string) error {
+	var outPath string
+	assumeYes := false
+	rest := args[:0:0]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-y", "--yes":
+			assumeYes = true
+		case "-o", "--output":
+			if i+1 >= len(args) {
+				return usageError("-o requires a file path")
+			}
+			outPath = args[i+1]
+			i++
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if len(rest) != 0 {
+		return usageError("export takes no positional arguments")
+	}
+
+	vault, err := openVault(name)
+	if err != nil {
+		return err
+	}
+
+	dest := "stdout"
+	if outPath != "" {
+		dest = outPath
+	}
+	if !assumeYes {
+		warning := fmt.Sprintf("This writes UNENCRYPTED credentials to %s. Continue? [y/N]: ", dest)
+		answer, err := readLine(warning)
+		if err != nil {
+			return err
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+		default:
+			fmt.Println("Aborted.")
+			return nil
+		}
+	}
+
+	data, err := json.MarshalIndent(vault, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode vault: %w", err)
+	}
+
+	if outPath == "" {
+		fmt.Println(string(data))
+		return nil
+	}
+	if err := os.WriteFile(outPath, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write export: %w", err)
+	}
+	fmt.Printf("Exported %d item(s) to %s\n", len(vault.Items), outPath)
+	return nil
+}
+
+// cmdImport merges items from a plaintext JSON file (same schema as export) into
+// the vault. Existing services are skipped unless --overwrite is given. Requires
+// an active session.
+func cmdImport(name string, args []string) error {
+	overwrite := false
+	rest := args[:0:0]
+	for _, a := range args {
+		switch a {
+		case "--overwrite":
+			overwrite = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if len(rest) != 1 {
+		return usageError("import requires exactly one <file> argument")
+	}
+
+	data, err := os.ReadFile(rest[0])
+	if err != nil {
+		return fmt.Errorf("read import file: %w", err)
+	}
+	var incoming model.Vault
+	if err := json.Unmarshal(data, &incoming); err != nil {
+		return fmt.Errorf("parse import file: %w", err)
+	}
+
+	vault, err := openVault(name)
+	if err != nil {
+		return err
+	}
+
+	var added, skipped, overwritten int
+	for _, item := range incoming.Items {
+		if item.Service == "" {
+			return fmt.Errorf("import file contains an item with an empty service name")
+		}
+		existing := vault.Find(item.Service)
+		switch {
+		case existing == nil:
+			vault.Items = append(vault.Items, item)
+			added++
+		case overwrite:
+			*existing = item
+			overwritten++
+		default:
+			skipped++
+		}
+	}
+
+	if err := saveVault(name, vault); err != nil {
+		return err
+	}
+	fmt.Printf("Imported: %d added, %d overwritten, %d skipped.\n", added, overwritten, skipped)
+	return nil
+}
 
 // cmdVaults lists every vault in ~/.lockbox and whether each is unlocked.
 func cmdVaults(args []string) error {
