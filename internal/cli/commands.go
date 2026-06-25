@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"lockbox/internal/agent"
@@ -205,11 +207,23 @@ func cmdAdd(name string, args []string) error {
 }
 
 // cmdGet prints the credentials for a service. Requires an active session.
+// With -p/--password it prints only the password, with no label or trailing
+// newline, so it pipes cleanly (e.g. `lockbox get github -p | pbcopy`).
 func cmdGet(name string, args []string) error {
-	if len(args) != 1 {
+	passwordOnly := false
+	rest := args[:0:0]
+	for _, a := range args {
+		switch a {
+		case "-p", "--password":
+			passwordOnly = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if len(rest) != 1 {
 		return usageError("get requires exactly one <service> argument")
 	}
-	service := args[0]
+	service := rest[0]
 
 	vault, err := openVault(name)
 	if err != nil {
@@ -219,6 +233,11 @@ func cmdGet(name string, args []string) error {
 	item := vault.Find(service)
 	if item == nil {
 		return fmt.Errorf("no credentials found for %q", service)
+	}
+
+	if passwordOnly {
+		fmt.Print(item.Password)
+		return nil
 	}
 
 	fmt.Printf("Service:  %s\n", item.Service)
@@ -255,22 +274,47 @@ func cmdList(name string, args []string) error {
 	return nil
 }
 
-// cmdDelete removes a service. Requires an active session.
+// cmdDelete removes a service. Requires an active session. Because there is no
+// undo, it asks for confirmation first; -f/--force skips the prompt.
 func cmdDelete(name string, args []string) error {
-	if len(args) != 1 {
+	force := false
+	rest := args[:0:0]
+	for _, a := range args {
+		switch a {
+		case "-f", "--force":
+			force = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if len(rest) != 1 {
 		return usageError("delete requires exactly one <service> argument")
 	}
-	service := args[0]
+	service := rest[0]
 
 	vault, err := openVault(name)
 	if err != nil {
 		return err
 	}
 
-	if !vault.Remove(service) {
+	if vault.Find(service) == nil {
 		return fmt.Errorf("no credentials found for %q", service)
 	}
 
+	if !force {
+		answer, err := readLine(fmt.Sprintf("Delete credentials for %q? This cannot be undone [y/N]: ", service))
+		if err != nil {
+			return err
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+		default:
+			fmt.Println("Aborted.")
+			return nil
+		}
+	}
+
+	vault.Remove(service)
 	if err := saveVault(name, vault); err != nil {
 		return err
 	}
@@ -278,6 +322,50 @@ func cmdDelete(name string, args []string) error {
 	fmt.Printf("Deleted credentials for %q\n", service)
 	return nil
 }
+
+// cmdStatus reports whether the selected vault has a live session and, if so,
+// when it will auto-lock. Requires no session of its own.
+func cmdStatus(name string, args []string) error {
+	if len(args) != 0 {
+		return usageError("status takes no arguments")
+	}
+	if !agent.Alive(name) {
+		fmt.Printf("Vault %q is locked. Run %s to start a session.\n", name, unlockHint(name))
+		return nil
+	}
+	expiresAt, err := agent.Status(name)
+	if err != nil {
+		return sessionError(name, err)
+	}
+	fmt.Printf("Vault %q is unlocked. Auto-locks at %s if idle (%s max).\n",
+		name, formatExpiry(expiresAt), agent.MaxTTL)
+	return nil
+}
+
+// cmdGen prints a freshly generated random password. An optional argument sets
+// the length (default genDefaultLength). It needs no vault or session.
+func cmdGen(args []string) error {
+	length := genDefaultLength
+	if len(args) > 1 {
+		return usageError("gen takes at most one <length> argument")
+	}
+	if len(args) == 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return usageError(fmt.Sprintf("invalid length %q", args[0]))
+		}
+		length = n
+	}
+	pw, err := crypto.GeneratePassword(length)
+	if err != nil {
+		return err
+	}
+	fmt.Println(pw)
+	return nil
+}
+
+// genDefaultLength is the password length used by `gen` when none is given.
+const genDefaultLength = 20
 
 // cmdVaults lists every vault in ~/.lockbox and whether each is unlocked.
 func cmdVaults(args []string) error {

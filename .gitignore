@@ -1,5 +1,23 @@
+# Build artifacts
 /lockbox
 /lockbox.exe
+/dist/
+
+# Vault data and session sockets (never commit secrets)
 *.vault
 *.sock
-/dist/
+
+# Go test / coverage / profiling output
+*.test
+*.out
+coverage.*
+*.prof
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db

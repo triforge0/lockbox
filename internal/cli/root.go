@@ -33,11 +33,13 @@ Commands:
   init                Create a new encrypted vault
   unlock              Start a session (prompts for the master password)
   add <service>       Add credentials for a service
-  get <service>       Show credentials for a service
+  get <service>       Show credentials for a service (-p prints only the password)
   list                List all stored services
-  delete <service>    Remove credentials for a service
+  delete <service>    Remove credentials for a service (-f skips confirmation)
   lock                End the session immediately
+  status              Show whether the vault is unlocked and when it auto-locks
   vaults              List all vaults and whether each is unlocked
+  gen [length]        Generate a random password (default length 20)
   version             Print the lockbox version
 
 Global flags:
@@ -94,6 +96,10 @@ func run(args []string) error {
 		return cmdUnlock(vault, cmdArgs)
 	case "lock":
 		return cmdLock(vault, cmdArgs)
+	case "status":
+		return cmdStatus(vault, cmdArgs)
+	case "gen":
+		return cmdGen(cmdArgs)
 	case "add":
 		return cmdAdd(vault, cmdArgs)
 	case "get":
