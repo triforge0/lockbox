@@ -33,12 +33,18 @@ Commands:
   init                Create a new encrypted vault
   unlock              Start a session (prompts for the master password)
   add <service>       Add credentials for a service
+  edit <service>      Update a service's username/password (blank keeps current)
   get <service>       Show credentials for a service (-p prints only the password)
-  list                List all stored services
+  list                List all stored services (-l shows usernames too)
+  search <query>      List services matching a query (name or username)
+  totp <service>      Print the current 2FA code for a service
   delete <service>    Remove credentials for a service (-f skips confirmation)
   lock                End the session immediately
+  change-password     Change the vault's master password (re-encrypts the vault)
   status              Show whether the vault is unlocked and when it auto-locks
   vaults              List all vaults and whether each is unlocked
+  export              Write the vault as plaintext JSON (-o file, asks to confirm)
+  import <file>       Merge items from a plaintext JSON file (--overwrite)
   gen [length]        Generate a random password (default length 20)
   version             Print the lockbox version
 
@@ -96,16 +102,28 @@ func run(args []string) error {
 		return cmdUnlock(vault, cmdArgs)
 	case "lock":
 		return cmdLock(vault, cmdArgs)
+	case "change-password":
+		return cmdChangePassword(vault, cmdArgs)
 	case "status":
 		return cmdStatus(vault, cmdArgs)
 	case "gen":
 		return cmdGen(cmdArgs)
 	case "add":
 		return cmdAdd(vault, cmdArgs)
+	case "edit", "update":
+		return cmdEdit(vault, cmdArgs)
 	case "get":
 		return cmdGet(vault, cmdArgs)
 	case "list":
 		return cmdList(vault, cmdArgs)
+	case "search":
+		return cmdSearch(vault, cmdArgs)
+	case "totp":
+		return cmdTOTP(vault, cmdArgs)
+	case "export":
+		return cmdExport(vault, cmdArgs)
+	case "import":
+		return cmdImport(vault, cmdArgs)
 	case "delete":
 		return cmdDelete(vault, cmdArgs)
 	case "vaults":
