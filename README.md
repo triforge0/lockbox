@@ -2,17 +2,25 @@
 
 A minimal, secure, cross-platform CLI password manager written in Go.
 
-Credentials are stored in a single encrypted file at `~/.lockbox/store.vault`.
-There is no database and no network access — just one local, encrypted blob.
+Credentials are stored in a single encrypted file under `~/.lockbox/` (the
+default vault is `store.vault`). There is no database and no network access —
+just one local, encrypted blob.
+
+You can keep several independent vaults side by side with the global
+`--vault <name>`/`-V` flag. Each named vault is a separate file with its own
+master password and its own session, so unlocking one never decrypts another.
 
 ## Security
 
 - The encryption key is derived from your master password with **Argon2id**
-  (64 MiB, 1 pass, 4 lanes).
+  (64 MiB, 3 passes, 4 lanes). Older vaults written with 1 pass are transparently
+  re-keyed to the stronger parameters the next time you unlock them.
 - The vault is encrypted as a single blob with **AES-256-GCM**.
 - Plaintext is never written to disk. The vault file is `0600`.
 - The salt is fixed for the life of the vault; each save uses a fresh nonce.
 - The master password is read without echoing to the terminal.
+- The agent only takes orders from another process running the same `lockbox`
+  binary, so other local processes (even same-user) can't ask it to decrypt.
 
 ## Sessions
 
@@ -21,14 +29,16 @@ in-memory session backed by a background agent:
 
 - `lockbox unlock` prompts for the master password, derives the key, and starts
   a detached agent that holds the **key in memory** (never on disk) and serves
-  encrypt/decrypt requests over a Unix-domain socket at `~/.lockbox/agent.sock`
-  (`0600`). The key is passed to the agent over a pipe — never via the command
-  line and never written to disk.
+  encrypt/decrypt requests over a per-vault Unix-domain socket (`0600`) under
+  `~/.lockbox/` (`agent.sock` for the default vault). The key is passed to the
+  agent over a pipe — never via the command line and never written to disk.
 - `add`, `get`, `list`, and `delete` require an active session. If none exists
   (or it has expired), they tell you to run `lockbox unlock`.
-- The session expires automatically **24 hours** after unlock; the agent
-  self-destructs and wipes the key.
-- `lockbox lock` ends the session immediately.
+- The session auto-locks after **15 minutes** of inactivity (each command
+  resets the timer), capped at an absolute **24 hours**; when it expires the
+  agent self-destructs and wipes the key.
+- `lockbox status` shows whether the vault is unlocked and when it will lock;
+  `lockbox lock` ends the session immediately.
 
 ## Install
 
@@ -71,19 +81,31 @@ internal/
   model/          Vault / Item types
   crypto/         Argon2id + AES-256-GCM
   storage/        on-disk envelope + ~/.lockbox paths
-  agent/          the 24h session: daemon, socket IPC, spawn
+  agent/          the in-memory session: daemon, socket IPC, spawn, peer-auth
 ```
 
 ## Usage
 
 ```sh
 lockbox init                # create a new empty encrypted vault
-lockbox unlock              # start a 24h session (prompts for master password)
+lockbox unlock              # start a session (prompts for master password)
 lockbox add <service>       # add credentials (prompts for username + password)
 lockbox get <service>       # print credentials for a service
+lockbox get <service> -p    # print only the password (pipe-friendly, no newline)
 lockbox list                # list all stored service names
-lockbox delete <service>    # remove a service
+lockbox delete <service>    # remove a service (asks to confirm; -f to skip)
+lockbox status              # show whether the vault is unlocked
 lockbox lock                # end the session immediately
+lockbox vaults              # list all vaults and whether each is unlocked
+lockbox gen [length]        # generate a random password (default length 20)
+```
+
+Use a named vault with the global `--vault`/`-V` flag (it can appear anywhere):
+
+```sh
+lockbox --vault work init
+lockbox -V work unlock
+lockbox -V work add github
 ```
 
 Typical flow:
@@ -92,7 +114,7 @@ Typical flow:
 lockbox init
 lockbox unlock
 lockbox add github
-lockbox get github
+lockbox get github -p | pbcopy   # copy the password to the clipboard
 lockbox lock
 ```
 
@@ -102,7 +124,7 @@ There is no recovery if you forget the master password — by design.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "salt": "...base64...",
   "nonce": "...base64...",
   "ciphertext": "...base64..."
@@ -110,7 +132,8 @@ There is no recovery if you forget the master password — by design.
 ```
 
 `ciphertext` is the AES-256-GCM encryption of the vault's JSON representation
-(`{"items":[{"service","username","password"}, ...]}`).
+(`{"items":[{"service","username","password"}, ...]}`). Version 1 vaults (1-pass
+Argon2id) are still readable and are upgraded to version 2 on the next unlock.
 
 ## Releasing
 

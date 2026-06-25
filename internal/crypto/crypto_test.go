@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -74,5 +75,36 @@ func TestFreshNoncePerEncrypt(t *testing.T) {
 	}
 	if bytes.Equal(c1, c2) {
 		t.Error("ciphertext identical across saves")
+	}
+}
+
+func TestGeneratePassword(t *testing.T) {
+	for _, length := range []int{1, 16, 20, 64} {
+		pw, err := GeneratePassword(length)
+		if err != nil {
+			t.Fatalf("GeneratePassword(%d): %v", length, err)
+		}
+		if len(pw) != length {
+			t.Errorf("GeneratePassword(%d) returned length %d", length, len(pw))
+		}
+		for _, r := range pw {
+			if !strings.ContainsRune(passwordAlphabet, r) {
+				t.Errorf("password contains out-of-alphabet rune %q", r)
+			}
+		}
+	}
+
+	if _, err := GeneratePassword(0); err == nil {
+		t.Error("GeneratePassword(0) should error")
+	}
+	if _, err := GeneratePassword(-5); err == nil {
+		t.Error("GeneratePassword(-5) should error")
+	}
+
+	// Two generations of a non-trivial length must not collide.
+	a, _ := GeneratePassword(20)
+	b, _ := GeneratePassword(20)
+	if a == b {
+		t.Error("two generated passwords were identical")
 	}
 }
